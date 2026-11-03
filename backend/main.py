@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from database import get_db, test_connection
+from accounts import router as accounts_router
 from models import User
 from config import ACCESS_TOKEN_EXPIRE_MINUTES
 from schemas import LoginRequest, RegisterRequest, TokenResponse, UserResponse
@@ -23,6 +24,7 @@ app = FastAPI(
     description="Backend for PayFlow UPI Payment Simulation",
     version="1.0.0"
 )
+app.include_router(accounts_router)
 
 # Allow React frontend to communicate with FastAPI
 app.add_middleware(
@@ -45,7 +47,7 @@ async def database_error_handler(request: Request, exc: SQLAlchemyError):
 @app.middleware("http")
 async def prevent_auth_caching(request: Request, call_next):
     response = await call_next(request)
-    if request.url.path in {"/register", "/login", "/me"}:
+    if request.url.path in {"/register", "/login", "/me", "/accounts"} or request.url.path.startswith("/accounts/"):
         response.headers["Cache-Control"] = "no-store"
     return response
 

@@ -2,6 +2,7 @@ import { useState } from 'react'
 import type { FormEvent } from 'react'
 import { apiRequest, registerUser } from './api'
 import { useAuth } from './useAuth'
+import AccountPanel from './AccountPanel'
 import './App.css'
 
 type Feedback = { kind: 'success' | 'error'; text: string } | null
@@ -88,7 +89,7 @@ function App() {
         <span className="simulation-badge"><span /> Learning sandbox</span>
       </header>
 
-      <main className="auth-layout">
+      <main className={`auth-layout${user ? ' dashboard-layout' : ''}`}>
         <section className="intro" aria-labelledby="intro-title">
           <div className="eyebrow"><span className="eyebrow-line" /> A LITTLE PRACTICE. A LOT OF POSSIBILITY.</div>
           <h1 id="intro-title">Your next step <br />starts with <br /><span>PayFlow.</span></h1>
@@ -113,6 +114,7 @@ function App() {
                 <div><dt>User ID</dt><dd>#{user.id}</dd></div>
                 <div><dt>Member since</dt><dd>{new Date(user.created_at).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' })}</dd></div>
               </dl>
+              {auth.session && <AccountPanel key={auth.session.token} token={auth.session.token} onLogout={auth.logout} />}
               {feedback && <p role={feedback.kind === 'error' ? 'alert' : 'status'} className={`feedback ${feedback.kind}`}>{feedback.text}</p>}
               <button className="primary-button" onClick={refreshProfile} disabled={busy}>{busy ? 'Refreshing…' : 'Refresh profile'}<span aria-hidden="true">↗</span></button>
               <button className="secondary-button" onClick={() => { auth.logout(); setEmail(''); setFeedback({ kind: 'success', text: 'You’ve signed out of this browser session.' }); setMode('login') }}>Log out</button>

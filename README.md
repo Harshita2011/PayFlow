@@ -1,8 +1,10 @@
-# PayFlow — Phase 2 authentication
+# PayFlow — Phase 3 bank accounts and UPI IDs
 
-PayFlow is a local UPI payment **simulation** for learning. Phase 2 implements
+PayFlow is a local UPI payment **simulation** for learning. Phase 2 provides
 registration → login → JWT access token → protected profile → client-side logout.
-It does not process real money.
+Phase 3 adds one fictional bank account and an automatically generated @payflow
+identity per authenticated user, starting at **₹0.00 simulated funds**.
+There are no real bank connections, real payments, deposits, or transfers.
 
 ## Run locally (PowerShell)
 
@@ -12,6 +14,7 @@ Backend, in one terminal:
 cd D:\PayFLow\backend
 docker start payflow-postgres-5436
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m alembic upgrade head
 .\.venv\Scripts\python.exe -m uvicorn main:app --reload --port 8001
 ```
 
@@ -32,7 +35,7 @@ previous key. `ACCESS_TOKEN_EXPIRE_MINUTES` accepts integers from 1 to 60 and
 defaults to 15. A missing/short signing key prevents startup instead of silently
 using a public default. No table creation, schema changes, data deletion, or
 database resets happen at application startup. This project expects the existing
-`users` table.
+`users` and migrated `bank_accounts` tables.
 
 Frontend, in another terminal:
 
@@ -75,7 +78,179 @@ running, stop that server and restart it to load the new dependencies/settings.
 | `.gitignore` | Keeps local secrets, virtual environments, caches, dependencies, and generated builds out of source control. Allows `.env.example` templates. |
 | `README.md` | This runbook, request-flow explanation, manual checks, test instructions, and limitations. |
 
-`models.py` and `database.py` are reused without changes; no migration is needed.
+The Phase 2 authentication dependencies and `database.py` are reused unchanged.
+`models.py` now also defines `BankAccount`; apply migrations before starting the API.
+
+## Phase 3 architecture and file changes
+
+```mermaid
+erDiagram
+    users ||--o| bank_accounts : "owns at most one"
+    users {
+        int id PK
+        string email UK
+    }
+    bank_accounts {
+        int id PK
+        int user_id FK,UK
+        string bank_name
+        string account_number UK
+        string upi_id UK
+        decimal balance "NUMERIC(18,2)"
+        datetime created_at
+    }
+```
+
+No account status is stored because Phase 3 has no freeze/close/delete actions.
+`user_id` references `users.id` with `ON DELETE RESTRICT`; a unique constraint
+enforces one account per user even if two requests arrive together. Account
+numbers and UPI IDs each have their own unique constraint. Every column is
+required. Check constraints restrict banks, account-number and UPI formats,
+and finite nonnegative balances. The UPI ID belongs to the account, which belongs
+to exactly one user. It is created when that user creates their account.
+
+| New or changed file | Phase 3 purpose |
+| --- | --- |
+| `backend/models.py` | Adds the `DemoBank` enum, `BankAccount`, named constraints, Decimal balance, and optional `User.bank_account` relationship. No existing user columns are altered. |
+| `backend/account_schemas.py` | Accepts only a valid `bank_name`; rejects owner IDs, numbers, UPI IDs, balances, and all other extra fields. Defines safe output and serializes Decimal to exactly two decimal places as a JSON string. |
+| `backend/accounts.py` | Small protected router for bank choices, creation, listing, and owner-only detail. Generates identifiers, masks account numbers, and retries uniqueness collisions within savepoints. |
+| `backend/main.py` | Includes the account router and marks account responses `Cache-Control: no-store`. Reuses existing authentication, CORS, validation, and safe 503 database handling. |
+| `backend/requirements.txt` | Adds Alembic for versioned migrations. |
+| `backend/alembic.ini` | Locates migration scripts; contains no credentials or connection URL. |
+| `backend/migrations/env.py` | Loads the existing configured database URL and model metadata. Runs transactional online migrations, with a five-second lock timeout for normal CLI use. Accepts a supplied connection for isolated migration tests. |
+| `backend/migrations/script.py.mako` | Template for generating future migration revisions. The default downgrade refuses destructive reversal. |
+| `backend/migrations/versions/0001_users_baseline.py` | Checks and adopts the pre-Alembic users table without modifying rows. On a fresh database, explicitly creates its Phase 2 schema. Refuses unexpected existing schemas. |
+| `backend/migrations/versions/0002_bank_accounts.py` | Creates only the new account table and its constraints; no user data update, table replacement, or deletion. |
+| `backend/tests/test_register.py` | Extends the shared isolated SQLite fixture with the account table and enabled foreign-key enforcement. Existing auth/registration tests remain. |
+| `backend/tests/test_accounts.py` | Tests auth, ownership, masks, zero balance, exact serialization, bad/extra input, uniqueness, retries, bounds/formats, FK/CHECK/NOT NULL constraints, and safe errors. |
+| `backend/tests/test_migrations.py` | Tests fresh upgrades, repeat upgrades, model/migration agreement, and preservation of existing users in temporary transaction-scoped PostgreSQL schemas. |
+| `frontend/src/api.ts` | Adds an account response type with `balance: string` and authenticated account/bank API functions using the existing request helper. |
+| `frontend/src/AccountPanel.tsx` | Loads the user's account and bank choices; displays loading, retry/error, empty/create, and account-card states. Handles 401 by calling the existing logout mechanism. Ignores responses after logout/unmount. |
+| `frontend/src/App.tsx` | Mounts the account panel only for authenticated sessions; logout unmounts it and removes account details. |
+| `frontend/src/App.css` | Extends existing styles with responsive account card, bank picker, and profile/dashboard layout. |
+| `frontend/src/AccountPanel.test.tsx` | Tests bank choices, loading, empty/display/create states, string precision, failures/retries, disabled submissions, expired sessions, and late responses. |
+| `frontend/src/App.test.tsx` | Preserves Phase 2 scenarios with account-aware mocks; adds a check that logout removes the displayed account and UPI ID. |
+| `README.md` | Adds Phase 3 architecture, migrations, API usage, design decisions, and verification instructions. |
+
+Credentials, JWT secrets, password behavior, and the memory-only auth hook are
+unchanged. No frontend or API dependency was added apart from backend Alembic.
+
+### Apply migrations safely
+
+From `D:\PayFLow\backend`:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m alembic current
+.\.venv\Scripts\python.exe -m alembic upgrade head
+.\.venv\Scripts\python.exe -m alembic current
+.\.venv\Scripts\python.exe -m alembic check
+```
+
+The expected head is `0002_bank_accounts`. The implementation already applied
+these migrations to the configured local database and verified the existing
+user was preserved. Repeating `upgrade head` is a no-op.
+
+No manual `stamp`, database reset, or `Base.metadata.create_all()` is required.
+The baseline inspects an existing users table; online migration is intentional
+and offline SQL generation is disabled. Both revisions refuse downgrades rather
+than dropping user/account data. Changes should use reviewed forward migrations.
+If a table differs unexpectedly or a lock cannot be acquired, migration fails
+instead of silently modifying/replacing it. Migration files freeze their original
+schema; change banks or constraints later through a new revision.
+
+To create a future revision after deliberately changing models:
+
+```powershell
+.\.venv\Scripts\python.exe -m alembic revision --autogenerate -m "describe the change"
+```
+
+Review generated SQL/schema changes before applying them, especially any removal.
+
+### Account creation and UPI generation
+
+1. React fetches `GET /accounts` and `GET /accounts/banks` with the existing
+   Bearer token. The server is the source of truth for bank choices.
+2. The user chooses **Grove Demo Bank**, **Orbit Demo Bank**, or **River Demo Bank**.
+   React sends only `{ "bank_name": "Grove Demo Bank" }` to `POST /accounts`.
+3. `get_current_user` validates the JWT and loads its user. The backend derives
+   ownership from that user; the client cannot nominate another owner.
+4. The server creates a number with `SIM` plus 16 cryptographically random digits.
+   It builds a safe lowercase ASCII name slug (fallback `learner`) plus a random
+   12-hex-character suffix and `@payflow`. For example,
+   `harsh-kumar-a1b2c3d4e5f6@payflow`. Users cannot claim an arbitrary address.
+5. The server sets `Decimal("0.00")` regardless of client wishes. The database
+   also supplies a zero default for inserts that omit the balance.
+6. A savepoint encloses each attempted insert. A number/UPI uniqueness collision
+   rolls back that attempt and generates fresh identifiers, up to five attempts.
+   A duplicate-owner constraint returns 409. Other database errors use the
+   existing safe 503 handler. On success the session commits the single account.
+7. Only masked account numbers are returned. The UI shows the exact balance,
+   bank name, masked number, and sandbox-only UPI ID. No funds can be added or sent.
+
+`NUMERIC(18,2)` stores up to 16 whole-number digits and two fractional digits.
+Python `Decimal` avoids binary floating-point rounding (such as in `0.1 + 0.2`).
+The API emits `"0.00"`, not `0.0`. React keeps the balance as a string and never
+uses `Number` or `parseFloat` to display it. All balances in this phase use the
+single simulated INR denomination; there is no currency-conversion feature.
+
+### Phase 3 API examples and manual checks
+
+Use http://localhost:8001/docs. Register/login as described below, then click
+**Authorize** and enter only the JWT value.
+
+| Endpoint | Expected result |
+| --- | --- |
+| `GET /accounts/banks` | 200; predefined fictional bank names. |
+| `GET /accounts` | 200; `[]` before creation, otherwise only the signed-in user's account. |
+| `POST /accounts` | 201 with the account; 409 if this user already has one. |
+| `GET /accounts/{account_id}` | 200 for the owner; 404 for missing or another user's account. |
+
+Creation request:
+
+```json
+{ "bank_name": "Grove Demo Bank" }
+```
+
+Illustrative response (IDs/timestamps/identifiers will differ):
+
+```json
+{
+  "id": 1,
+  "bank_name": "Grove Demo Bank",
+  "masked_account_number": "SIM •••• •••• •••• 1234",
+  "upi_id": "harsh-kumar-a1b2c3d4e5f6@payflow",
+  "balance": "0.00",
+  "created_at": "2026-11-03T12:00:00Z"
+}
+```
+
+Check these behaviors:
+
+1. With no authorization, account endpoints return 401.
+2. An unused user sees an empty account list. Create one account and verify the
+   balance is the JSON **string** `"0.00"`; the full account number is absent.
+3. Repeat creation: expect 409 and still exactly one account.
+4. Choose an unlisted bank or include `balance`, `user_id`, `account_number`, or
+   `upi_id` in the request: expect 422, without creating anything.
+5. Sign in as a different test user and request the first account's ID: expect
+   404. Its list remains empty until it creates its own account.
+6. In React, sign in and choose a demo bank. Submit once, inspect the card, refresh
+   accounts, then log out: account details disappear. Sign in again to retrieve
+   the same persisted account. Browser refresh still signs out as in Phase 2.
+7. Test phone width, account-loading failures, and retry using Refresh accounts.
+   A timed-out creation may still have committed on the server; refresh before
+   retrying. The database unique constraint prevents a second account.
+
+Manual creation saves fictional records in the development database. Do not
+delete those records or reset volumes as part of these checks.
+
+### Next phase
+
+Phase 4 can add simulated transfers and transaction records with atomic debits
+and credits, concurrency control, and idempotency. None are implemented here.
+Account balances cannot be topped up through Phase 3 APIs or UI. Real UPI
+networks and real banking remain outside this learning project.
 
 ## How requests work
 
@@ -209,8 +384,8 @@ From `D:\PayFLow\backend`:
 .\.venv\Scripts\python.exe -B -m unittest discover -s tests -v
 ```
 
-The default suite creates isolated in-memory SQLite databases. The one test
-specific to PostgreSQL uniqueness errors is skipped in this mode.
+The default suite creates isolated in-memory SQLite databases. Five PostgreSQL-only
+tests (migration, regex/NaN checks, and uniqueness-race checks) are skipped in this mode.
 
 To run the full suite against the configured PostgreSQL database:
 
@@ -237,9 +412,11 @@ React tests mock fetch and exercise real forms/state; they never access your
 database. `npm run build` runs TypeScript checks before creating the production
 bundle. No test prints live credentials or tokens.
 
-Executed during implementation: **23 PostgreSQL backend tests passed**,
-**10 frontend tests passed**, production build/type checks passed, ESLint passed.
-The PostgreSQL saved-user count was unchanged before/after the suite.
+Executed for Phase 3: **39 PostgreSQL backend tests passed** (including all Phase 2
+tests), **22 frontend tests passed**, production build/type checks passed, ESLint
+passed, and Alembic reported no model/schema differences. Default SQLite mode
+passed 34 tests with the five PostgreSQL-only tests skipped. The saved counts
+remained **1 user and 0 accounts**; existing user credentials were preserved.
 
 A real Chromium browser also completed registration → invalid login → valid
 login → protected profile → refresh → logout → reload against a temporary API
@@ -247,6 +424,13 @@ using an outer PostgreSQL transaction. Confirmation validation, memory-only
 storage, mobile overflow, and the backend-check button passed with no page errors.
 The temporary API and frontend servers were stopped afterward; test user rows
 were not saved. Desktop and phone layouts were visually inspected.
+
+For Phase 3, the real-browser check additionally passed empty-state loading,
+bank selection, account creation, exact `"0.00"` serialization, masked output,
+UPI format, duplicate rejection, cross-user 404/empty-list protection, account
+refresh, logout, and re-login retrieval of the same account. Phone layout had
+no horizontal overflow and Chromium reported no page errors. This check used
+the same outer-transaction strategy; its users and accounts were not saved.
 
 ## Local-development security limits
 
@@ -266,9 +450,11 @@ were not saved. Desktop and phone layouts were visually inspected.
   audit warnings. The production dependency audit reports 0 vulnerabilities.
   No forced/breaking dependency downgrade was applied. Starlette currently emits
   an httpx TestClient deprecation warning; the tests still pass.
-- Future work includes deliberate migration management, rate limits, verified
-  email, and a reviewed session strategy. No payments or banking features were
-  added in this phase.
+- Future security work includes rate limits, verified email, and a reviewed
+  session strategy. There are no real payments or real banking integrations.
 
 References: [FastAPI password hashing and JWT tutorial](https://fastapi.tiangolo.com/tutorial/security/oauth2-jwt/)
 and [PyJWT claim verification](https://pyjwt.readthedocs.io/en/stable/usage.html).
+Phase 3 references: [Alembic migrations](https://alembic.sqlalchemy.org/en/latest/tutorial.html),
+[SQLAlchemy constraints](https://docs.sqlalchemy.org/en/20/core/constraints.html),
+and [Pydantic decimal serialization](https://docs.pydantic.dev/latest/api/standard_library_types/#decimals).

@@ -5,7 +5,7 @@ from uuid import uuid4
 
 from fastapi.testclient import TestClient
 from psycopg.errors import NotNullViolation, UniqueViolation
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
@@ -13,7 +13,7 @@ from sqlalchemy.pool import StaticPool
 from config import DATABASE_URL
 from database import get_db
 from main import app, password_hasher
-from models import User
+from models import BankAccount, User
 
 
 class DatabaseTestCase(unittest.TestCase):
@@ -35,7 +35,11 @@ class DatabaseTestCase(unittest.TestCase):
                 "sqlite://", connect_args={"check_same_thread": False},
                 poolclass=StaticPool,
             )
+            @event.listens_for(self.engine, "connect")
+            def enable_foreign_keys(connection, record):
+                connection.execute("PRAGMA foreign_keys=ON")
             User.__table__.create(self.engine)
+            BankAccount.__table__.create(self.engine)
             self.db = Session(self.engine, expire_on_commit=False)
 
         def override_db():

@@ -11,6 +11,15 @@ export interface LoginResult {
   expires_in: number
 }
 
+export interface BankAccount {
+  id: number
+  bank_name: string
+  masked_account_number: string
+  upi_id: string
+  balance: string
+  created_at: string
+}
+
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8001').replace(/\/$/, '')
 
 export class ApiError extends Error {
@@ -61,4 +70,19 @@ export function loginUser(email: string, password: string) {
 
 export function getProfile(token: string) {
   return apiRequest<User>('/me', { headers: { Authorization: `Bearer ${token}` } })
+}
+
+export function getAccounts(token: string) {
+  return apiRequest<BankAccount[]>('/accounts', { headers: { Authorization: `Bearer ${token}` } })
+}
+
+export function getDemoBanks(token: string) {
+  return apiRequest<string[]>('/accounts/banks', { headers: { Authorization: `Bearer ${token}` } })
+}
+
+export function createAccount(token: string, bank_name: string) {
+  return apiRequest<BankAccount>('/accounts', {
+    method: 'POST', headers: { Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ bank_name }),
+  })
 }
