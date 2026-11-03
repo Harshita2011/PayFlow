@@ -1,10 +1,12 @@
-# PayFlow — Phase 3 bank accounts and UPI IDs
+# PayFlow — Phase 4 simulated payment engine
 
 PayFlow is a local UPI payment **simulation** for learning. Phase 2 provides
 registration → login → JWT access token → protected profile → client-side logout.
 Phase 3 adds one fictional bank account and an automatically generated @payflow
 identity per authenticated user, starting at **₹0.00 simulated funds**.
-There are no real bank connections, real payments, deposits, or transfers.
+Phase 4 adds controlled demo funding, confirmed simulated transfers, a balanced
+ledger, idempotent retries, receipts, and history. There are no real bank
+connections, actual UPI networks, real money, or QR payment features.
 
 ## Run locally (PowerShell)
 
@@ -35,7 +37,7 @@ previous key. `ACCESS_TOKEN_EXPIRE_MINUTES` accepts integers from 1 to 60 and
 defaults to 15. A missing/short signing key prevents startup instead of silently
 using a public default. No table creation, schema changes, data deletion, or
 database resets happen at application startup. This project expects the existing
-`users` and migrated `bank_accounts` tables.
+`users`, `bank_accounts`, and migrated payment/ledger tables.
 
 Frontend, in another terminal:
 
@@ -82,6 +84,9 @@ The Phase 2 authentication dependencies and `database.py` are reused unchanged.
 `models.py` now also defines `BankAccount`; apply migrations before starting the API.
 
 ## Phase 3 architecture and file changes
+
+This section documents the existing account foundation. Phase 4 extends it with
+the protected funding and transfer flows described in the Phase 4 section below.
 
 ```mermaid
 erDiagram
@@ -147,9 +152,9 @@ From `D:\PayFLow\backend`:
 .\.venv\Scripts\python.exe -m alembic check
 ```
 
-The expected head is `0002_bank_accounts`. The implementation already applied
-these migrations to the configured local database and verified the existing
-user was preserved. Repeating `upgrade head` is a no-op.
+Phase 3 introduced `0002_bank_accounts`; the current head is now
+`0003_payment_engine`. These migrations are applied to the configured local
+database and existing records were preserved. Repeating `upgrade head` is a no-op.
 
 No manual `stamp`, database reset, or `Base.metadata.create_all()` is required.
 The baseline inspects an existing users table; online migration is intentional
@@ -186,7 +191,8 @@ Review generated SQL/schema changes before applying them, especially any removal
    A duplicate-owner constraint returns 409. Other database errors use the
    existing safe 503 handler. On success the session commits the single account.
 7. Only masked account numbers are returned. The UI shows the exact balance,
-   bank name, masked number, and sandbox-only UPI ID. No funds can be added or sent.
+   bank name, masked number, and sandbox-only UPI ID. Phase 4 adds funds and sends
+   only through the controlled payment engine, never through account updates.
 
 `NUMERIC(18,2)` stores up to 16 whole-number digits and two fractional digits.
 Python `Decimal` avoids binary floating-point rounding (such as in `0.1 + 0.2`).
@@ -247,12 +253,373 @@ delete those records or reset volumes as part of these checks.
 
 ### Next phase
 
-Phase 4 can add simulated transfers and transaction records with atomic debits
-and credits, concurrency control, and idempotency. None are implemented here.
-Account balances cannot be topped up through Phase 3 APIs or UI. Real UPI
+Phase 4 now implements simulated transfers with atomic debits/credits,
+concurrency control, and idempotency. Account APIs still cannot accept balances;
+only the new controlled demo-funding endpoint adds fictional funds. Real UPI
 networks and real banking remain outside this learning project.
 
-## How requests work
+## Phase 4 — simulated payment engine
+
+Current flow: **demo funds → exact recipient lookup → explicit confirmation →
+atomic transfer → immutable receipt and history**. Everything is fictional INR.
+Authentication, account creation, ownership protection, and password/JWT settings
+are reused. No dependency or secret changes were needed for Phase 4.
+
+### Ledger relationships and source of truth
+
+```mermaid
+erDiagram
+    users ||--o{ payment_requests : scopes
+    bank_accounts ||--|| ledger_accounts : represents
+    bank_accounts ||--o{ payments : sends_or_receives
+    payments ||--o{ ledger_entries : posts
+    ledger_accounts ||--o{ ledger_entries : receives
+    payment_requests |o--o| payments : remembers_result
+```
+
+The ledger also has one dedicated `demo-funding` account without a customer bank
+account. Every user account is represented by `bank-<internal account id>`.
+The migration creates existing ledger accounts; a database trigger registers
+future bank accounts automatically. Internal ledger IDs are never supplied by
+the frontend.
+
+**Signed convention:** debit is negative; credit is positive. A ₹125.50 transfer
+posts −125.50 to the sender and +125.50 to the recipient. Demo funding posts
+−1000.00 to `demo-funding` and +1000.00 to the user's ledger account. The system
+ledger therefore tracks the negative offset for fictional money issuance; it is
+not a real bank reserve or a user account that can receive transfers. Per-user
+funding limits control issuance through the API.
+
+A successful payment must have **exactly two entries**, the correct accounts,
+matching amounts, and a zero net sum. A failed payment has no ledger entries and
+moves no funds. Amounts are `NUMERIC(18,2)` / Python `Decimal`; JSON amounts and
+balances are exact two-decimal **strings**. Currency is restricted to INR.
+
+The immutable ledger is the monetary source of truth. `BankAccount.balance` is a
+current-balance cache used for locked sufficient-funds checks. Deferred PostgreSQL
+constraint triggers reject a commit unless every changed bank balance equals its
+ledger sum and every posting is valid. Triggers reject updates/deletes to payment,
+ledger-entry, and ledger-account rows, and edits to completed idempotency results.
+Future corrections must be explicit reversal postings, not edits to history;
+reversal APIs are not implemented in this phase.
+
+The migration never replaces existing accounts or balances. If a legacy account
+has a nonzero balance, it creates an explicit balanced opening funding payment
+with note `Phase 3 opening balance`, leaving the cached balance unchanged. Such an
+opening payment counts toward the lifetime funding-action limit. The actual
+development account had zero balance, so no opening payment was necessary.
+
+### Atomicity, row locks, and idempotency
+
+Each funding/transfer request uses one SQLAlchemy session and one database
+transaction for **all** financial writes:
+
+1. Validate input and derive the actor from the JWT. Require a UUID
+   `Idempotency-Key` header. No client sender ID, balance, owner, or currency is
+   accepted.
+2. Reserve `(authenticated user id, key)` in `payment_requests` with PostgreSQL
+   `INSERT ... ON CONFLICT`. A unique primary key makes concurrent duplicates
+   wait for the first transaction to finish. This works across API workers.
+3. Compare a SHA-256 fingerprint of operation type and normalized request fields.
+   An identical completed request returns its original HTTP status/body. Changed
+   amount, recipient, note, or operation with the same key returns **409**.
+   Equivalent amounts such as `"100"` and `"100.00"` have the same fingerprint.
+4. Load affected bank accounts with `SELECT ... ORDER BY id FOR UPDATE`, always
+   in ascending account-ID order. Refresh ORM values after acquiring locks.
+   A second spender must wait, then reads the newly committed balance. Opposing
+   transfers use the same lock order rather than locking sender-first.
+5. While locks are held, check funds, self-payment, destination capacity, and
+   funding limits. Write the payment, both signed entries, and both balance
+   changes. Store the final response against the request key.
+6. Check deferred ledger/cache invariants and commit once. There are no separate
+   sender and recipient commits. Any unexpected exception rolls the whole unit
+   back, including its key reservation. A database trigger prevents unfinished
+   request reservations from being committed.
+
+Business rejections (insufficient funds, self-payment, unknown recipient, funding
+limit) are terminal results for that key. They normally create an immutable
+`FAILED` payment with no ledger entries, visible in the initiator's history.
+The unpaid recipient does not see a failed incoming transfer. If the actor has no
+bank account, only the final 404 idempotency result is stored, without a payment.
+Input-validation/authentication failures happen before key reservation.
+
+**Retry policy:**
+
+- A confirmed success is replayed with its original receipt; funds move once.
+- A stored business failure is replayed even if circumstances later change.
+  For example, retrying an insufficient-funds request after funding still returns
+  the original failure. Reviewing a genuinely new payment requires a new key.
+- A deadlock, serialization failure, five-second lock timeout, unexpected error,
+  or uncertain commit connection failure returns a safe **503**. Retry the
+  **same key and payload**. If the first attempt committed, it replays; otherwise
+  it can execute once. The server does not silently retry with a new key.
+- A lost network response does not prove failure. The frontend freezes that
+  intent and offers **Retry same request** rather than starting another payment.
+
+### Funding, recipient privacy, and payment limits
+
+- `POST /demo/fund` accepts only `{}`. It adds exactly **₹1,000** to the caller's
+  account, at most **three successful actions per user for the lifetime of this
+  local dataset**. Retries do not consume another action. The account row lock
+  also serializes simultaneous funding-limit checks. There is no reset/admin
+  funding API.
+- `POST /payments/resolve` requires an exact, normalized `@payflow` ID and returns
+  only display name, demo bank, and UPI ID. No email, account number, or balance
+  is returned. Misses return `Recipient not available`; self-lookup is rejected.
+  A persisted per-user fixed window allows **10 lookups per database-clock
+  minute**, including misses, across API workers. Further requests return 429
+  with `Retry-After: 60`. Random UPI suffixes further discourage guessing.
+- Transfers accept **₹0.01 through ₹100,000.00** per request. Amounts must be
+  decimal strings with at most two places; JSON floats, exponent notation,
+  NaN/Infinity, negative, zero, overprecision, and extra fields are rejected.
+  Notes are optional, trimmed, and limited to 140 characters.
+- Payment history includes outgoing, incoming successful transfers, demo funding,
+  and the caller's failed attempts. Receipts contain only participant-facing
+  fields. Unrelated transaction IDs and inaccessible pagination cursors return
+  404. Pagination uses descending `(created_at, transaction id)` keyset ordering
+  with a default page size of 10 and maximum 50. It is not a frozen export
+  snapshot; refresh history to see new arrivals.
+
+### React request recovery and storage
+
+`PaymentPanel` is mounted only for the current account. It looks up the recipient
+and shows the name, bank, UPI ID, note, and amount **before** an explicit Confirm
+button can send. Amount validation uses integer minor units (`BigInt`) and exact
+strings, never binary floating-point arithmetic.
+
+Before a money-changing request is sent, the UI stores only its UUID key,
+operation, recipient/amount/note in `sessionStorage`, scoped to the account ID.
+No JWT, password, email, or account number is stored there. If storage is
+unavailable, the UI refuses to send rather than losing its retry key. A known
+success or terminal rejection clears only the matching saved intent. A late
+response from an old logged-out component cannot erase a newer request.
+
+After a network/503 uncertainty, other money actions are disabled until the
+original request is retried. Refreshing still loses the in-memory JWT and signs
+out; after signing back into the same account in the same tab, the unresolved
+request is restored as **Retry same request**. Logging out hides all financial
+UI, while a genuinely unresolved request remains recoverable for that account.
+Different accounts use different storage keys.
+
+Session storage is readable by same-origin JavaScript and disappears when the
+tab is closed/cleared. Never treat it as trusted ownership or authentication.
+After losing browser storage, inspect server history before intentionally making
+another payment. Production-grade cross-device/offline recovery is future work.
+
+Success shows a receipt, refreshes the exact cached balance, and reloads history.
+Balance refresh errors never reinterpret a confirmed payment as an uncertain
+transfer. Manual account refresh preserves the payment component and pending
+intent; stale account reads cannot overwrite a newer post-payment balance read.
+Incoming users can refresh accounts/history to see arrivals; no live-push service
+is implemented.
+
+### Phase 4 added/modified files
+
+| File | Purpose |
+| --- | --- |
+| `backend/payment_models.py` | Payment, signed ledger entries/accounts, scoped idempotency requests, and lookup-window models, keys, indexes, and checks. Uses the existing `Base`, users, and accounts. |
+| `backend/payment_schemas.py` | Strict decimal-string and UPI validation; safe recipient, receipt, and history schemas with precise serialization. |
+| `backend/payments.py` | Protected funding/lookup/transfer/history/receipt router; deterministic locking, fingerprint/replay handling, atomic posting, safe rollback, immutable public snapshots, and keyset pagination. |
+| `backend/migrations/versions/0003_payment_engine.py` | Additive financial tables; system/legacy ledger setup; account-registration, immutability, completion, balanced-posting, and reconciliation triggers. Downgrade refuses financial-data removal. |
+| `backend/migrations/env.py` | Registers payment model metadata for Alembic comparison. |
+| `backend/main.py` | Includes the payment router, permits the Idempotency-Key CORS header, and disables caching for payment/demo responses. |
+| `backend/reconcile.py` | Read-only consistent-snapshot audit of global ledger sum, each cached bank balance, and successful/failed posting structure. Exits nonzero on drift; never repairs data. |
+| `backend/tests/payment_support.py` | Separate payment test database and a fresh isolated schema/session factory per test, permitting real multi-connection commits without touching development records. No destructive cleanup. |
+| `backend/tests/test_payments.py` | Funding, privacy, input checks, ledger invariants, partial-SQL-write rollback, deadlock/serialization handling, access control, key reuse/conflicts, parallel funding/spending/duplicate requests, and pagination tests. |
+| `backend/tests/test_migrations.py` | Updated head/table assertions and a positive legacy-balance preservation/opening-ledger test. |
+| `frontend/src/api.ts` | Typed payment functions, Idempotency-Key headers, decimal-string response types, and structured failed-receipt error bodies. |
+| `frontend/src/PaymentPanel.tsx` | Funding, recipient confirmation, exact amount checks, request recovery, receipts, history/pagination, loading/disabled/error states, and stale-response guards. |
+| `frontend/src/AccountPanel.tsx` | Mounts the payment panel; refreshes balances without losing pending requests and ignores stale balance reads. |
+| `frontend/src/App.css` | Small responsive additions using the existing visual style; no UI framework. |
+| `frontend/src/PaymentPanel.test.tsx` | Confirmation, funding, receipts/history, failed and uncertain outcomes, same-key retries/remount recovery, storage failure, disabled submissions, and logout/unmount races. |
+| `frontend/src/AccountPanel.test.tsx`, `src/App.test.tsx` | Preserve earlier scenarios with payment-aware mocks and bank-form-specific assertions. |
+| `frontend/src/test-setup.ts` | Clears simulated pending-request session storage between tests after restoring mocks. |
+| `README.md` | Phase 4 design, API, runbook, verification, and security tradeoffs. |
+
+User credentials, secrets, existing account columns, and authentication behavior
+are unchanged. No real payment-provider integration or Phase 5 work was added.
+
+### API examples using /docs
+
+Start the API and open http://localhost:8001/docs. Log in and use **Authorize**
+with the JWT. For funding/transfer, generate a UUID in PowerShell with
+`[guid]::NewGuid().ToString()` and enter it in the **Idempotency-Key** header field.
+Use a fresh key for each intended new action; keep the original for a retry.
+
+| Request | Body/result |
+| --- | --- |
+| `POST /demo/fund` | `{}` plus required UUID header; 201 receipt for exactly `"1000.00"`. Fourth successful action is prevented with 429. |
+| `POST /payments/resolve` | `{ "upi_id": "recipient-123abc@payflow" }`; name/bank/UPI only. |
+| `POST /payments/transfer` | Body below plus UUID header; 201 receipt, or terminal 400/404/429 with detail and failed receipt. |
+| `GET /payments/history?limit=10` | `{ "items": [...], "next_cursor": "uuid-or-null" }`. |
+| `GET /payments/history?before=<next_cursor>&limit=10` | Next older page in stable keyset order. |
+| `GET /payments/<transaction_id>` | Owner/participant receipt, otherwise 404. |
+
+Transfer request:
+
+```json
+{
+  "upi_id": "recipient-123abc@payflow",
+  "amount": "125.50",
+  "note": "Shared demo lunch"
+}
+```
+
+Illustrative sender receipt (IDs/UPI IDs/times vary):
+
+```json
+{
+  "transaction_id": "8e90f266-1418-43f9-8eb3-103162bb6e85",
+  "type": "TRANSFER",
+  "direction": "OUTGOING",
+  "status": "SUCCESS",
+  "amount": "125.50",
+  "currency": "INR",
+  "counterparty_name": "Recipient Learner",
+  "counterparty_upi_id": "recipient-123abc@payflow",
+  "recipient_upi_id": "recipient-123abc@payflow",
+  "note": "Shared demo lunch",
+  "failure_reason": null,
+  "created_at": "2026-11-03T12:00:00Z"
+}
+```
+
+The recipient sees direction `INCOMING` with the sender as counterparty. Repeating
+the exact request/header returns the original receipt, with no additional debit.
+Changing the note or amount under that key returns 409. Do not share login-token
+screenshots, Authorization headers, or real credentials.
+
+### Migrate, run, audit, and test
+
+The Phase 4 migration was applied to the configured local database as
+`0003_payment_engine`. Every existing user/account row was compared before/after
+within the migration transaction. Current development data remains **1 user,
+1 account with its original zero balance, and no demo payment records**.
+
+Backend (PowerShell):
+
+```powershell
+cd D:\PayFLow\backend
+docker start payflow-postgres-5436
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m alembic upgrade head
+.\.venv\Scripts\python.exe -m alembic check
+.\.venv\Scripts\python.exe -B reconcile.py
+.\.venv\Scripts\python.exe -m uvicorn main:app --reload --port 8001
+```
+
+`upgrade head` is a no-op when current. Migrations are transactional, additive,
+and forward-only. Do not downgrade, reset tables, or alter ledger rows to correct
+a payment. `alembic check` compares table metadata; integration tests verify the
+additional trigger behavior.
+
+Frontend (another terminal):
+
+```powershell
+cd D:\PayFLow\frontend
+npm install
+npm run dev -- --port 5173 --strictPort
+```
+
+Full PostgreSQL tests (backend directory):
+
+```powershell
+$env:REGISTER_TEST_POSTGRES = '1'
+.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v
+Remove-Item Env:REGISTER_TEST_POSTGRES
+```
+
+The configured PostgreSQL role needs permission to create the dedicated
+`payflow_phase4_tests` database once, then create schemas there. The test harness
+refuses to use that name as the development DATABASE_URL. Tests use fresh schemas
+and do not reuse saved test rows. Schemas are intentionally retained rather than
+deleted; cleanup would be a separate reviewed operation. No database, table,
+container, volume, or development record is dropped/reset by the suite.
+
+Frontend checks:
+
+```powershell
+cd D:\PayFLow\frontend
+npm test
+npm run build
+npm run lint
+```
+
+Executed: **58 PostgreSQL tests passed**, including prior-phase regressions,
+concurrent identical/different-key requests, concurrent spending/funding,
+opposing transfers, and injected failures after actual partial SQL writes.
+**35 React tests passed**, including request recovery after remount, refusal to
+send when session storage cannot save its key, and late-response safeguards.
+TypeScript, production build, ESLint, read-only reconciliation, and Alembic checks
+passed. Default SQLite mode passed **34 tests with 24 PostgreSQL-only tests skipped**;
+it does not substitute for the full PostgreSQL run. No tests failed or remained blocked.
+
+A real Chromium check completed two-user registration/accounts/funding/transfer,
+verified both balances and incoming/outgoing receipts/history, then deliberately
+lost a response **after server commit**. Same-key retry moved no additional money.
+A second browser check refreshed the page during uncertainty, signed back in,
+restored the original scoped request, and replayed the same key without double
+debit. Desktop/mobile layouts were inspected; no horizontal overflow or page
+errors were found. All browser payments used the separate test database.
+
+### Manual two-user walkthrough
+
+1. Open the app in two independent tabs/profiles. Register/sign in as Sender and
+   Recipient; create one demo bank account for each. Copy Recipient's @payflow ID.
+2. Sender clicks **Add ₹1,000 demo funds**. Verify **₹1000.00** and a FUNDING
+   history entry. These are fictional funds, not a real deposit.
+3. Enter Recipient's UPI ID, amount `125.50`, and an optional note. Click
+   **Review payment**. Verify the displayed recipient/bank/amount before clicking
+   **Confirm and send ₹125.50**.
+4. Verify the success receipt and Sender balance **₹874.50**. Recipient clicks
+   **Refresh accounts** and **Refresh history**: balance is **₹125.50**, and an
+   INCOMING entry opens the same transaction receipt.
+5. Try more than the current balance, your own UPI ID, an unknown UPI ID, and an
+   overprecision amount. There must be no partial balance change. Failed money
+   requests appear only in the appropriate caller's history, with no ledger move.
+6. In `/docs`, replay a successful transfer with the same key/body: same receipt,
+   unchanged balances. Reuse its key with a different amount: 409.
+7. For a simple uncertain-outcome exercise, stop the API before Confirm. Keep
+   the unresolved request, restart the API, and click **Retry same request**.
+   You may refresh/sign back in within the same tab; the key is restored.
+8. Log out. Profile, account, history, and receipt disappear. Do not clear browser
+   storage or create a new intent when an earlier payment's result is unknown;
+   resolve it or inspect history first.
+9. Run `reconcile.py`: expect `balanced: True`, empty `account_mismatches`, and
+   empty `invalid_postings`. It never changes a balance or repairs history.
+
+Manual actions intentionally save fictional payment records. Do not delete/reset
+them as a testing shortcut.
+
+### Phase 4 limitations
+
+- Educational local simulator only; no real bank, gateway, NPCI, or UPI calls.
+- The system funding ledger is a fictional issuer offset; this is not monetary
+  backing, settlement, or a production accounting/legal model.
+- One database and fixed INR; no reversals, refunds, scheduled payments,
+  multi-currency, external-provider reconciliation, or QR payments.
+- Three lifetime demo-funding actions per user. No automatic resets or unlimited
+  top-ups. Account creation and registration are not production abuse controls.
+- Lookup throttling is a basic authenticated-user fixed window, not full bot/IP
+  protection. Production needs broader rate limits, monitoring, and fraud controls.
+- Database triggers protect normal writes. A database owner/superuser can alter
+  them; deployment needs a separate least-privilege runtime role and audited
+  migration role. No existing role or credential was changed here.
+- Memory-only short-lived JWTs, client-side logout without token revocation, and
+  localhost HTTP retain Phase 2's limits. Production needs HTTPS, hardened
+  session management, secret storage, CSP/XSS defenses, and reviewed recovery.
+- Pending request metadata lasts only in its tab's session storage; no cross-device
+  recovery. Server-side idempotency results have no automatic expiry/deletion.
+- Deferred SUM-based reconciliation is intentionally simple and educational;
+  production throughput would require a reviewed accounting/storage strategy.
+- Existing development-tool audit warnings and TestClient deprecation noted
+  below remain; no unrelated toolchain changes were made.
+
+References: [PostgreSQL row locks](https://www.postgresql.org/docs/16/explicit-locking.html),
+[unique-key conflict handling](https://www.postgresql.org/docs/16/sql-insert.html),
+and [deferred constraint triggers](https://www.postgresql.org/docs/16/sql-createtrigger.html).
+
+## How authentication requests work
 
 ### Registration
 
@@ -307,7 +674,9 @@ than trusting token claims as current user data.
 
 `useAuth()` stores the token only in React memory. The UI shows a profile only
 after `/me` succeeds. Refreshing or closing the page loses authentication. There
-is no localStorage, sessionStorage, token cookie, or token in the URL.
+are no tokens in localStorage, sessionStorage, cookies, or URLs. Phase 4 stores
+only unresolved payment keys/payloads in account-scoped sessionStorage for retry
+recovery; authentication itself remains in memory.
 
 The Log out button clears local session state and user details. A late profile
 request cannot restore a logged-out session. A timer signs out at the configured
@@ -384,8 +753,9 @@ From `D:\PayFLow\backend`:
 .\.venv\Scripts\python.exe -B -m unittest discover -s tests -v
 ```
 
-The default suite creates isolated in-memory SQLite databases. Five PostgreSQL-only
-tests (migration, regex/NaN checks, and uniqueness-race checks) are skipped in this mode.
+The default suite validates authentication/accounts in isolated SQLite databases.
+PostgreSQL-only ledger, concurrency, migration, regex, and race tests are skipped.
+Always run the PostgreSQL command below to verify the payment engine.
 
 To run the full suite against the configured PostgreSQL database:
 
@@ -395,10 +765,12 @@ $env:REGISTER_TEST_POSTGRES = '1'
 Remove-Item Env:REGISTER_TEST_POSTGRES
 ```
 
-Each PostgreSQL test owns an outer transaction and uses session savepoints. Test
-inserts/updates are rolled back; no existing users are deleted, reset, or committed
-over. PostgreSQL sequences can still advance during rolled-back inserts, so gaps
-in user IDs are normal. No tables/containers/volumes are dropped.
+Existing regression tests use outer transactions/savepoints. Payment tests use
+real commits in the separate `payflow_phase4_tests` database, with one new schema
+per test, so parallel connections can observe each other's commits. No development
+records are deleted, reset, or committed over. Isolated test schemas are retained;
+the suite issues no cleanup DROP/DELETE/TRUNCATE commands. PostgreSQL sequences
+can advance during rolled-back regression inserts, so gaps in user IDs are normal.
 
 From `D:\PayFLow\frontend`:
 

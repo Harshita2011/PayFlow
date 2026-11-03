@@ -13,6 +13,7 @@ const json = (body: unknown, status = 200) => new Response(JSON.stringify(body),
 function mockAuthFetch(fetchMock: (url: string, options?: RequestInit) => unknown, accounts: BankAccount[] = []) {
   // Keep existing auth tests focused on their auth requests; the dashboard also loads accounts.
   vi.stubGlobal('fetch', (url: string, options?: RequestInit) => {
+    if (url.includes('/payments/history')) return Promise.resolve(json({ items: [], next_cursor: null }))
     if (url.endsWith('/accounts/banks')) return Promise.resolve(json(['Grove Demo Bank']))
     if (url.endsWith('/accounts') && options?.method !== 'POST') return Promise.resolve(json(accounts))
     return fetchMock(url, options)

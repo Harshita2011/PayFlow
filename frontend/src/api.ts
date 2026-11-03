@@ -24,10 +24,12 @@ const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:800
 
 export class ApiError extends Error {
   status: number
+  responseBody: unknown
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, responseBody?: unknown) {
     super(message)
     this.status = status
+    this.responseBody = responseBody
   }
 }
 
@@ -50,7 +52,7 @@ export async function apiRequest<T>(path: string, options: RequestInit = {}): Pr
       : Array.isArray(detail) ? detail.map((error: { loc?: string[]; msg?: string }) =>
         `${error.loc?.at(-1) || 'Input'}: ${error.msg || 'Invalid value'}`).join('. ')
       : 'Something went wrong. Please try again.'
-    throw new ApiError(message, response.status)
+    throw new ApiError(message, response.status, data)
   }
   if (data === null) throw new ApiError('The server returned an unexpected response. Please try again.', response.status)
   return data as T
@@ -85,4 +87,64 @@ export function createAccount(token: string, bank_name: string) {
     method: 'POST', headers: { Authorization: `Bearer ${token}` },
     body: JSON.stringify({ bank_name }),
   })
+}
+
+export interface Recipient {
+  display_name: string
+  bank_name: string
+  upi_id: string
+}
+
+export interface TransferInput {
+  upi_id: string
+  amount: string
+  note: string
+}
+
+export interface PaymentReceipt {
+  transaction_id: string
+  type: 'TRANSFER' | 'DEMO_FUNDING'
+  direction: 'INCOMING' | 'OUTGOING' | 'FUNDING'
+  status: 'SUCCESS' | 'FAILED'
+  amount: string
+  currency: 'INR'
+  counterparty_name: string
+  counterparty_upi_id: string | null
+  recipient_upi_id: string | null
+  note: string
+  failure_reason: string | null
+  created_at: string
+}
+
+export interface PaymentHistory {
+  items: PaymentReceipt[]
+  next_cursor: string | null
+}
+
+export function resolveRecipient(token: string, upi_id: string) {
+  return apiRequest<Recipient>('/payments/resolve', {
+    method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: JSON.stringify({ upi_id }),
+  })
+}
+
+export function fundDemo(token: string, key: string) {
+  return apiRequest<PaymentReceipt>('/demo/fund', {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Idempotency-Key': key }, body: '{}',
+  })
+}
+
+export function transferMoney(token: string, key: string, payload: TransferInput) {
+  return apiRequest<PaymentReceipt>('/payments/transfer', {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Idempotency-Key': key }, body: JSON.stringify(payload),
+  })
+}
+
+export function getPaymentHistory(token: string, before?: string) {
+  return apiRequest<PaymentHistory>(`/payments/history${before ? `?before=${encodeURIComponent(before)}` : ''}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  })
+}
+
+export function getPaymentReceipt(token: string, id: string) {
+  return apiRequest<PaymentReceipt>(`/payments/${encodeURIComponent(id)}`, { headers: { Authorization: `Bearer ${token}` } })
 }

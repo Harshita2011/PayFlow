@@ -13,6 +13,7 @@ const json = (data: unknown, status = 200) => new Response(JSON.stringify(data),
 
 function setupFetch(accountHandler: (options?: RequestInit) => Promise<Response>) {
   const mock = vi.fn((url: string, options?: RequestInit) => {
+    if (url.includes('/payments/history')) return Promise.resolve(json({ items: [], next_cursor: null }))
     if (url.endsWith('/accounts/banks')) return Promise.resolve(json(banks))
     return accountHandler(options)
   })
@@ -46,7 +47,7 @@ describe('Simulated bank accounts', () => {
     expect(screen.getByText(account.masked_account_number)).toBeTruthy()
     expect(screen.getByText(account.upi_id)).toBeTruthy()
     expect(screen.getByText(/Fictional funds/)).toBeTruthy()
-    expect(screen.queryByRole('form')).toBeNull()
+    expect(screen.queryByRole('form', { name: 'Create simulated bank account' })).toBeNull()
   })
 
   it('creates an account using only the bank selection and displays zero funds', async () => {
@@ -59,7 +60,7 @@ describe('Simulated bank accounts', () => {
     expect(screen.getByText('₹0.00')).toBeTruthy()
     const request = fetchMock.mock.calls.find(([, options]) => options?.method === 'POST')!
     expect(JSON.parse(String(request[1]?.body))).toEqual({ bank_name: banks[0] })
-    expect(screen.queryByRole('form')).toBeNull()
+    expect(screen.queryByRole('form', { name: 'Create simulated bank account' })).toBeNull()
   })
 
   it('rejects an empty bank choice before submitting', async () => {

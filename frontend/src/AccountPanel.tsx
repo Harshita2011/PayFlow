@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { ApiError, createAccount, getAccounts, getDemoBanks } from './api'
 import type { BankAccount } from './api'
+import PaymentPanel from './PaymentPanel'
 
 interface Props {
   token: string
@@ -17,13 +18,15 @@ export default function AccountPanel({ token, onLogout }: Props) {
   const [success, setSuccess] = useState('')
   const [reload, setReload] = useState(0)
   const generation = useRef(0)
+  const balanceRevision = useRef(0)
 
   useEffect(() => {
     let active = true
+    const revision = balanceRevision.current
     Promise.all([getAccounts(token), getDemoBanks(token)])
       .then(([accounts, choices]) => {
         if (!active) return
-        setAccount(accounts[0] ?? null)
+        if (revision === balanceRevision.current) setAccount(accounts[0] ?? null)
         setBanks(choices)
       })
       .catch((failure: unknown) => {
@@ -65,10 +68,18 @@ export default function AccountPanel({ token, onLogout }: Props) {
   }
 
   function refresh() {
+    balanceRevision.current += 1
     setLoading(true)
     setError('')
     setSuccess('')
     setReload((value) => value + 1)
+  }
+
+  async function refreshBalance() {
+    const current = generation.current
+    const revision = ++balanceRevision.current
+    const accounts = await getAccounts(token)
+    if (current === generation.current && revision === balanceRevision.current) setAccount(accounts[0] ?? null)
   }
 
   return (
@@ -102,10 +113,11 @@ export default function AccountPanel({ token, onLogout }: Props) {
                 <button className="primary-button" type="submit">{creating ? 'Creating demo account…' : 'Create demo account'}<span aria-hidden="true">↗</span></button>
               </fieldset>
             </form>
-            <p className="account-note">One simulated account per person. No deposits or transfers in this phase.</p>
+            <p className="account-note">One simulated account per person. Only fictional money is used.</p>
           </div>
         )}
       </>}
+      {account && <PaymentPanel key={account.id} token={token} accountId={account.id} onLogout={onLogout} onBalanceChanged={refreshBalance} />}
     </section>
   )
 }

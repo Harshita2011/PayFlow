@@ -91,3 +91,27 @@ select:focus { outline: 3px solid #71945130; border-color: #6a8c52; }
 .account-details dd { margin: 0; font-size: 13px; overflow-wrap: anywhere; }
 .bank-disclaimer { border-top: 1px solid #d3dfc6; padding-top: 13px; margin: 20px 0 0; font-size: 10px; color: #6d805f; line-height: 1.7; }
 @media (max-width: 720px) { .dashboard-layout { grid-template-columns: 1fr; } .dashboard-layout .intro { position: static; } .dashboard-layout .profile-details { grid-template-columns: 1fr; } .bank-card { padding: 17px; } .account-empty { padding: 15px; } }
+
+.payment-panel { margin-top: 26px; border-top: 1px solid #dce5d3; padding-top: 22px; }
+.payment-panel h4 { font-size: 14px; color: #344f32; margin: 16px 0; }
+.demo-funding { padding: 16px; background: #f1f5e9; border: 1px solid #dae4ce; border-radius: 10px; margin: 17px 0 25px; }
+.demo-funding p { font-size: 13px; color: #49643c; margin: 0; }
+.demo-funding p span { display: block; font-size: 10px; color: #7d8d70; margin: 6px 0 10px; }
+.payment-fields { display: grid; grid-template-columns: 1fr 1.4fr; gap: 14px; }
+.payment-confirm, .payment-receipt, .uncertain-payment { padding: 19px; margin-top: 20px; border: 1px solid #cadcb8; background: #f0f5e9; border-radius: 12px; overflow-wrap: anywhere; }
+.payment-confirm p, .payment-receipt p, .uncertain-payment p { font-size: 12px; line-height: 1.8; color: #617753; }
+.payment-confirm .confirm-amount, .payment-receipt .receipt-amount { font-size: 27px; font-weight: 600; color: #3b6034; margin: 12px 0; }
+.payment-receipt .receipt-amount small { font-size: 10px; font-weight: 400; }
+.payment-receipt .receipt-id { font-size: 10px; color: #859278; }
+.payment-receipt.failed, .uncertain-payment { background: #fff5e9; border-color: #ead8bd; }
+.uncertain-payment > strong { font-size: 13px; color: #886338; }
+.payment-history { border-top: 1px solid #e0e7d8; margin-top: 26px; padding-top: 13px; }
+.history-list { list-style: none; margin: 0; padding: 0; }
+.history-list li { border-bottom: 1px solid #e7ecdf; }
+.history-list button { display: flex; align-items: center; gap: 12px; width: 100%; border: 0; background: none; padding: 15px 0; text-align: left; }
+.history-direction { width: 31px; height: 31px; border-radius: 50%; background: #edf2e5; display: grid; place-items: center; color: #65834f; font-size: 18px; flex-shrink: 0; }
+.history-copy { display: grid; gap: 4px; flex: 1; min-width: 0; }
+.history-copy strong { font-size: 12px; font-weight: 550; color: #4a6240; overflow-wrap: anywhere; }
+.history-copy > span { font-size: 9px; color: #839177; }
+.history-amount { font-size: 13px; color: #49643b; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; max-width: 43%; }
+@media (max-width: 420px) { .payment-fields { grid-template-columns: 1fr; gap: 0; } .payment-confirm, .payment-receipt, .uncertain-payment { padding: 14px; } .history-list button { gap: 8px; } }

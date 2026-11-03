@@ -33,10 +33,10 @@ class MigrationTests(unittest.TestCase):
         command.upgrade(self.config, "head")
         command.upgrade(self.config, "head")
         inspector = inspect(self.connection)
-        self.assertEqual(set(inspector.get_table_names()), {"users", "bank_accounts", "alembic_version"})
+        self.assertEqual(set(inspector.get_table_names()), {"users", "bank_accounts", "alembic_version", "ledger_accounts", "payments", "ledger_entries", "payment_requests", "recipient_lookup_limits"})
         balance = next(c for c in inspector.get_columns("bank_accounts") if c["name"] == "balance")
         self.assertEqual((balance["type"].precision, balance["type"].scale), (18, 2))
-        self.assertEqual(self.connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one(), "0002_bank_accounts")
+        self.assertEqual(self.connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one(), "0003_payment_engine")
         command.check(self.config)
 
     def test_existing_users_are_adopted_without_changes(self):
@@ -49,3 +49,16 @@ class MigrationTests(unittest.TestCase):
         after = self.connection.execute(User.__table__.select()).all()
         self.assertEqual(before, after)
         self.assertTrue(inspect(self.connection).has_table("bank_accounts"))
+
+    def test_legacy_positive_balance_gets_balanced_opening_entries(self):
+        command.upgrade(self.config, "0002_bank_accounts")
+        self.connection.execute(User.__table__.insert().values(
+            full_name="Opening Balance Learner", email="opening@example.com", password_hash="test-only"
+        ))
+        self.connection.execute(text("""INSERT INTO bank_accounts(user_id,bank_name,account_number,upi_id,balance)
+            SELECT id,'Grove Demo Bank','SIM1234567890123456','opening@payflow',12.34 FROM users"""))
+        command.upgrade(self.config, "head")
+        self.assertEqual(str(self.connection.execute(text("SELECT balance FROM bank_accounts")).scalar_one()), "12.34")
+        self.assertEqual(self.connection.execute(text("SELECT count(*) FROM ledger_entries")).scalar_one(), 2)
+        self.assertEqual(self.connection.execute(text("SELECT sum(amount) FROM ledger_entries")).scalar_one(), 0)
+        self.assertEqual(self.connection.execute(text("SELECT note FROM payments")).scalar_one(), "Phase 3 opening balance")

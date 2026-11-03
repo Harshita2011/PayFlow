@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from database import get_db, test_connection
 from accounts import router as accounts_router
+from payments import router as payments_router
 from models import User
 from config import ACCESS_TOKEN_EXPIRE_MINUTES
 from schemas import LoginRequest, RegisterRequest, TokenResponse, UserResponse
@@ -25,6 +26,7 @@ app = FastAPI(
     version="1.0.0"
 )
 app.include_router(accounts_router)
+app.include_router(payments_router)
 
 # Allow React frontend to communicate with FastAPI
 app.add_middleware(
@@ -35,7 +37,7 @@ app.add_middleware(
     ],
     allow_credentials=False,
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_headers=["Content-Type", "Authorization", "Idempotency-Key"],
 )
 
 
@@ -47,7 +49,7 @@ async def database_error_handler(request: Request, exc: SQLAlchemyError):
 @app.middleware("http")
 async def prevent_auth_caching(request: Request, call_next):
     response = await call_next(request)
-    if request.url.path in {"/register", "/login", "/me", "/accounts"} or request.url.path.startswith("/accounts/"):
+    if request.url.path in {"/register", "/login", "/me", "/accounts"} or request.url.path.startswith(("/accounts/", "/payments/", "/demo/")):
         response.headers["Cache-Control"] = "no-store"
     return response
 
