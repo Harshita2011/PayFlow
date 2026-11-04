@@ -3,7 +3,7 @@ from decimal import Decimal
 from uuid import uuid4
 
 from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, JSON, Numeric, String, text
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database import Base
 
@@ -24,12 +24,12 @@ class Payment(Base):
     __table_args__ = (
         CheckConstraint("amount > 0 AND amount <= 9999999999999999.99", name="ck_payment_amount"),
         CheckConstraint("currency = 'INR'", name="ck_payment_currency"),
-        CheckConstraint("type IN ('TRANSFER', 'DEMO_FUNDING')", name="ck_payment_type"),
+        CheckConstraint("type IN ('TRANSFER', 'DEMO_FUNDING', 'SELF_TRANSFER')", name="ck_payment_type"),
         CheckConstraint("status IN ('SUCCESS', 'FAILED')", name="ck_payment_status"),
         CheckConstraint(
             "status = 'FAILED' OR (recipient_account_id IS NOT NULL AND "
             "((type = 'DEMO_FUNDING' AND sender_account_id IS NULL) OR "
-            "(type = 'TRANSFER' AND sender_account_id IS NOT NULL AND sender_account_id <> recipient_account_id)))",
+            "(type IN ('TRANSFER','SELF_TRANSFER') AND sender_account_id IS NOT NULL AND sender_account_id <> recipient_account_id)))",
             name="ck_payment_participants",
         ),
         Index("ix_payments_sender_history", "sender_account_id", "created_at", "id"),
@@ -50,6 +50,8 @@ class Payment(Base):
     note: Mapped[str] = mapped_column(String(140), default="")
     failure_reason: Mapped[str | None] = mapped_column(String(120))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP"))
+    sender_account = relationship("BankAccount", foreign_keys=[sender_account_id], lazy="selectin")
+    recipient_account = relationship("BankAccount", foreign_keys=[recipient_account_id], lazy="selectin")
 
 
 class LedgerEntry(Base):

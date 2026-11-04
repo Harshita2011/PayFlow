@@ -56,3 +56,10 @@ class RequestCreationLimit(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), primary_key=True)
     window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     attempts: Mapped[int] = mapped_column(Integer)
+
+
+class RequestDestination(Base):
+    """Pins incoming request payments without modifying any existing request terms."""
+    __tablename__ = "money_request_destinations"
+    request_id: Mapped[str] = mapped_column(ForeignKey("money_requests.id", ondelete="RESTRICT"), primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("bank_accounts.id", ondelete="RESTRICT"))

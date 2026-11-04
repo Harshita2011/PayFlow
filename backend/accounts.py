@@ -4,7 +4,7 @@ import unicodedata
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -35,6 +35,7 @@ def public_account(account: BankAccount) -> AccountResponse:
         upi_id=account.upi_id,
         balance=account.balance,
         created_at=account.created_at,
+        is_primary=account.is_primary,
     )
 
 
@@ -50,14 +51,17 @@ def create_account(
     db: Session = Depends(get_db),
 ):
     user_id, full_name = user.id, user.full_name
-    if db.scalar(select(BankAccount.id).where(BankAccount.user_id == user_id)) is not None:
-        raise HTTPException(status_code=409, detail="You already have a simulated account")
+    lock_account_config(db, user_id)
+    count = db.scalar(select(func.count()).select_from(BankAccount).where(BankAccount.user_id == user_id))
+    if count >= 4:
+        raise HTTPException(status_code=409, detail="Maximum four simulated accounts per user")
 
     for _ in range(5):
         account = BankAccount(
             user_id=user_id, bank_name=payload.bank_name.value,
             account_number=generate_account_number(), upi_id=generate_upi_id(full_name),
             balance=Decimal("0.00"),
+            is_primary=count == 0,
         )
         try:
             # A savepoint lets a collision retry without losing the outer transaction.
@@ -66,14 +70,10 @@ def create_account(
                 db.flush()
         except IntegrityError as exc:
             constraint = getattr(getattr(exc.orig, "diag", None), "constraint_name", None)
-            if constraint == "uq_bank_accounts_user_id":
-                raise HTTPException(status_code=409, detail="You already have a simulated account") from None
             if constraint in {"uq_bank_accounts_account_number", "uq_bank_accounts_upi_id"}:
                 continue
             # SQLite is used only in isolated tests; production uses PostgreSQL.
             if getattr(exc.orig, "sqlite_errorname", None) == "SQLITE_CONSTRAINT_UNIQUE":
-                if db.scalar(select(BankAccount.id).where(BankAccount.user_id == user_id)) is not None:
-                    raise HTTPException(status_code=409, detail="You already have a simulated account") from None
                 continue
             raise
         db.commit()
@@ -82,9 +82,32 @@ def create_account(
     raise HTTPException(status_code=503, detail="Could not allocate account identifiers. Please try again")
 
 
+def lock_account_config(db: Session, user_id: int):
+    if db.bind.dialect.name == "postgresql":
+        db.execute(text("SET LOCAL lock_timeout='5s'"))
+        db.execute(text("SELECT pg_advisory_xact_lock(709,:uid)"), {"uid": user_id})
+
+
+@router.patch("/{account_id}/primary", response_model=AccountResponse)
+def set_primary(account_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    lock_account_config(db, user.id)
+    accounts = list(db.scalars(select(BankAccount).where(BankAccount.user_id == user.id).order_by(BankAccount.id).with_for_update().execution_options(populate_existing=True)))
+    chosen = next((account for account in accounts if account.id == account_id), None)
+    if chosen is None:
+        raise HTTPException(404, "Account not found")
+    if not chosen.is_primary:
+        for account in accounts:
+            account.is_primary = False
+        db.flush()  # Partial uniqueness is immediate; exactly-one is deferred to commit.
+        chosen.is_primary = True
+        db.flush()
+    db.commit()
+    return public_account(chosen)
+
+
 @router.get("", response_model=list[AccountResponse])
 def list_accounts(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    accounts = db.scalars(select(BankAccount).where(BankAccount.user_id == user.id).order_by(BankAccount.id))
+    accounts = db.scalars(select(BankAccount).where(BankAccount.user_id == user.id).order_by(BankAccount.is_primary.desc(), BankAccount.id))
     return [public_account(account) for account in accounts]
 
 

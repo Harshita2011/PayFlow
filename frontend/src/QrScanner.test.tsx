@@ -20,6 +20,18 @@ function upload() {
 }
 
 describe('QR scanner and my QR', () => {
+  it('hides the old QR and download while a different account identity is being encoded', async () => {
+    let resolve!: (image: string) => void
+    mock.png.mockResolvedValueOnce('data:image/png;base64,old').mockImplementationOnce(() => new Promise((done) => { resolve = done }))
+    const view = render(<MyQrCode upiId="first@payflow" initiallyOpen />)
+    await screen.findByRole('img')
+    view.rerender(<MyQrCode upiId="second@payflow" initiallyOpen />)
+    expect(screen.queryByRole('img')).toBeNull()
+    expect(screen.queryByRole('link', { name: 'Download QR as PNG' })).toBeNull()
+    expect(screen.getByText('second@payflow')).toBeTruthy()
+    await act(async () => { resolve('data:image/png;base64,new') })
+    expect((await screen.findByRole('img')).getAttribute('src')).toBe('data:image/png;base64,new')
+  })
   it('wraps Tab and Shift+Tab within the dialog', () => {
     render(<QrScanner ownUpiId="self@payflow" onRecipient={vi.fn()} onClose={vi.fn()} />)
     const close = screen.getByRole('button', { name: 'Close QR scanner' })

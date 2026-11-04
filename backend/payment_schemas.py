@@ -22,6 +22,7 @@ class RecipientRequest(BaseModel):
 
 
 class TransferRequest(RecipientRequest):
+    source_account_id: int | None = Field(default=None, gt=0, strict=True)
     amount: Decimal = Field(gt=0, le=Decimal("100000.00"), max_digits=18, decimal_places=2)
     note: str = Field(default="", max_length=140)
 
@@ -42,6 +43,31 @@ class FundingRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class DemoFundingRequest(FundingRequest):
+    account_id: int | None = Field(default=None, gt=0, strict=True)
+
+
+class RequestPayInput(FundingRequest):
+    source_account_id: int | None = Field(default=None, gt=0, strict=True)
+
+
+class SelfTransferRequest(FundingRequest):
+    source_account_id: int = Field(gt=0, strict=True)
+    destination_account_id: int = Field(gt=0, strict=True)
+    amount: Decimal = Field(gt=0, le=Decimal("100000.00"), max_digits=18, decimal_places=2)
+    note: str = Field(default="", max_length=140)
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def exact_amount(cls, value):
+        return TransferRequest.exact_amount(value)
+
+    @field_validator("note")
+    @classmethod
+    def clean_note(cls, value):
+        return value.strip()
+
+
 class RecipientResponse(BaseModel):
     display_name: str
     bank_name: str
@@ -50,8 +76,8 @@ class RecipientResponse(BaseModel):
 
 class PaymentReceipt(BaseModel):
     transaction_id: str
-    type: Literal["TRANSFER", "DEMO_FUNDING"]
-    direction: Literal["INCOMING", "OUTGOING", "FUNDING"]
+    type: Literal["TRANSFER", "DEMO_FUNDING", "SELF_TRANSFER"]
+    direction: Literal["INCOMING", "OUTGOING", "FUNDING", "SELF"]
     status: Literal["SUCCESS", "FAILED"]
     amount: Decimal
     currency: Literal["INR"] = "INR"
@@ -61,6 +87,10 @@ class PaymentReceipt(BaseModel):
     note: str
     failure_reason: str | None
     created_at: datetime
+    source_bank: str | None = None
+    source_masked_account: str | None = None
+    destination_bank: str | None = None
+    destination_masked_account: str | None = None
 
     @field_serializer("amount")
     def serialize_amount(self, value: Decimal) -> str:

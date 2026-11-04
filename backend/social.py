@@ -10,10 +10,13 @@ from sqlalchemy.orm import Session, aliased
 from database import get_db
 from models import BankAccount, User
 from payment_models import Payment
-from payment_schemas import FundingRequest, PaymentReceipt, TransferRequest
+from payment_schemas import FundingRequest, PaymentReceipt, RequestPayInput, TransferRequest
 from payments import execute_payment, own_account, request_fingerprint, resolve_recipient
 from security import get_current_user
-from social_models import Contact, MoneyRequest
+from social_models import Contact, MoneyRequest, RequestDestination
+from request_limits import reserve_capacity
+from accounts import lock_account_config
+from split_service import lock_linked_split
 from social_schemas import ContactCreate, ContactResponse, FavoriteUpdate, MoneyRequestCreate, MoneyRequestPage, MoneyRequestResponse, PublicPerson, RecentContact
 
 router = APIRouter(tags=["Contacts and money requests"])
@@ -22,7 +25,7 @@ REQUEST_TTL = timedelta(days=7)
 
 def contact_query(owner_id):
     return select(Contact, User.full_name, BankAccount.upi_id).join(User, User.id == Contact.contact_user_id).join(
-        BankAccount, BankAccount.user_id == User.id).where(Contact.owner_user_id == owner_id)
+        BankAccount, BankAccount.user_id == User.id).where(Contact.owner_user_id == owner_id, BankAccount.is_primary.is_(True))
 
 
 def contact_output(row):
@@ -80,17 +83,19 @@ def favorite(contact_id: UUID, payload: FavoriteUpdate, user: User = Depends(get
 
 @router.get("/contacts/recent", response_model=list[RecentContact])
 def recent_contacts(limit: int = Query(10, ge=1, le=20), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    account = own_account(db, user.id)
-    # Group counterpart accounts in SQL, then join public identity once: no N+1 queries.
-    other = case((Payment.sender_account_id == account.id, Payment.recipient_account_id), else_=Payment.sender_account_id)
-    activity = select(other.label("account_id"), func.max(Payment.created_at).label("latest")).where(
-        Payment.type == "TRANSFER", Payment.status == "SUCCESS",
-        or_(Payment.sender_account_id == account.id, Payment.recipient_account_id == account.id)
-    ).group_by(other).subquery()
+    own_account(db, user.id)
+    own_ids = select(BankAccount.id).where(BankAccount.user_id == user.id)
+    other_id = case((Payment.sender_account_id.in_(own_ids), Payment.recipient_account_id), else_=Payment.sender_account_id)
+    other = aliased(BankAccount)
+    activity = select(other.user_id.label("user_id"), func.max(Payment.created_at).label("latest")).join_from(
+        Payment, other, other.id == other_id).where(Payment.type == "TRANSFER", Payment.status == "SUCCESS",
+        or_(Payment.sender_account_id.in_(own_ids), Payment.recipient_account_id.in_(own_ids)), other.user_id != user.id
+    ).group_by(other.user_id).subquery()
     rows = db.execute(select(User.full_name, BankAccount.upi_id, activity.c.latest).join_from(
-        activity, BankAccount, BankAccount.id == activity.c.account_id).join(User, User.id == BankAccount.user_id)
-        .where(User.id != user.id).order_by(activity.c.latest.desc(), BankAccount.upi_id).limit(limit))
+        activity, User, User.id == activity.c.user_id).join(BankAccount, BankAccount.user_id == User.id)
+        .where(BankAccount.is_primary.is_(True)).order_by(activity.c.latest.desc(), BankAccount.upi_id).limit(limit))
     return [RecentContact(display_name=name, upi_id=upi, last_interacted_at=latest) for name, upi, latest in rows]
+
 
 
 def participant(user_id):
@@ -101,8 +106,8 @@ def request_query():
     requester, payer = aliased(User), aliased(User)
     requester_account, payer_account = aliased(BankAccount), aliased(BankAccount)
     return select(MoneyRequest, requester.full_name, requester_account.upi_id, payer.full_name, payer_account.upi_id).join(
-        requester, requester.id == MoneyRequest.requester_user_id).join(requester_account, requester_account.user_id == requester.id).join(
-        payer, payer.id == MoneyRequest.payer_user_id).join(payer_account, payer_account.user_id == payer.id)
+        requester, requester.id == MoneyRequest.requester_user_id).join(RequestDestination, RequestDestination.request_id == MoneyRequest.id).join(requester_account, requester_account.id == RequestDestination.account_id).join(
+        payer, payer.id == MoneyRequest.payer_user_id).join(payer_account, (payer_account.user_id == payer.id) & payer_account.is_primary.is_(True))
 
 
 def request_output(row, now):
@@ -139,21 +144,14 @@ def create_request(payload: MoneyRequestCreate, response: Response, idempotency_
             raise HTTPException(409, "Idempotency key was already used for a different request")
         response.status_code = 200
         return public_request(db, existing.id)
-    now = db.scalar(select(func.clock_timestamp()))
-    attempts = db.execute(text("""INSERT INTO request_creation_limits(user_id,window_start,attempts)
-        VALUES (:uid,date_trunc('hour',clock_timestamp()),1)
-        ON CONFLICT(user_id) DO UPDATE SET window_start=EXCLUDED.window_start,
-        attempts=CASE WHEN request_creation_limits.window_start=EXCLUDED.window_start
-          THEN LEAST(request_creation_limits.attempts+1,11) ELSE 1 END RETURNING attempts"""), {"uid": user.id}).scalar_one()
-    pending = (MoneyRequest.status == "PENDING", MoneyRequest.expires_at > now)
-    outgoing = db.scalar(select(func.count()).select_from(MoneyRequest).where(MoneyRequest.requester_user_id == user.id, *pending))
-    incoming = db.scalar(select(func.count()).select_from(MoneyRequest).where(MoneyRequest.payer_user_id == target.user_id, *pending))
-    if attempts > 10 or outgoing >= 20 or incoming >= 50:
-        db.commit()  # Keep the rate counter even for a rejected action; no money moved.
-        raise HTTPException(429, "Request limit reached. Try later or resolve outstanding requests", headers={"Retry-After": "3600"})
+    now = reserve_capacity(db, user.id, [target.user_id])
+    lock_account_config(db, user.id)
+    destination = own_account(db, user.id)
     item = MoneyRequest(requester_user_id=user.id, payer_user_id=target.user_id, amount=payload.amount,
         note=payload.note, creation_key=str(idempotency_key), fingerprint=fingerprint, created_at=now, updated_at=now, expires_at=now + REQUEST_TTL)
     db.add(item)
+    db.flush()
+    db.add(RequestDestination(request_id=item.id, account_id=destination.id))
     db.flush()
     result = public_request(db, item.id)
     db.commit()
@@ -195,6 +193,7 @@ def get_request(request_id: UUID, user: User = Depends(get_current_user), db: Se
 def close_request(db, request_id, user_id, status):
     owner = MoneyRequest.payer_user_id if status == "DECLINED" else MoneyRequest.requester_user_id
     db.execute(text("SET LOCAL lock_timeout='5s'"))
+    lock_linked_split(db, str(request_id))
     item = db.scalar(select(MoneyRequest).where(MoneyRequest.id == str(request_id), owner == user_id).with_for_update().execution_options(populate_existing=True))
     if item is None:
         raise HTTPException(404, "Request not found")
@@ -222,10 +221,10 @@ def cancel(request_id: UUID, payload: FundingRequest, user: User = Depends(get_c
 
 
 @router.post("/payment-requests/{request_id}/pay", response_model=PaymentReceipt, status_code=201)
-def pay_request(request_id: UUID, payload: FundingRequest, idempotency_key: UUID = Header(), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def pay_request(request_id: UUID, payload: RequestPayInput, idempotency_key: UUID = Header(), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     item = db.scalar(select(MoneyRequest).where(MoneyRequest.id == str(request_id), MoneyRequest.payer_user_id == user.id))
     if item is None:
         raise HTTPException(404, "Request not found")
-    account = own_account(db, item.requester_user_id)
-    transfer = TransferRequest(upi_id=account.upi_id, amount=format(item.amount, ".2f"), note=item.note)
+    account = db.scalar(select(BankAccount).join(RequestDestination, RequestDestination.account_id == BankAccount.id).where(RequestDestination.request_id == item.id))
+    transfer = TransferRequest(upi_id=account.upi_id, amount=format(item.amount, ".2f"), note=item.note, source_account_id=payload.source_account_id)
     return execute_payment(db, user, str(idempotency_key), "TRANSFER", transfer, money_request_id=item.id)

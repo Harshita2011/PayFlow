@@ -33,7 +33,7 @@ class AccountTests(DatabaseTestCase):
         response = self.create()
         self.assertEqual(response.status_code, 201)
         data = response.json()
-        self.assertEqual(set(data), {"id", "bank_name", "masked_account_number", "upi_id", "balance", "created_at"})
+        self.assertEqual(set(data), {"id", "bank_name", "masked_account_number", "upi_id", "balance", "created_at", "is_primary"})
         account = self.db.get(BankAccount, data["id"])
         self.assertEqual(account.user_id, self.user_id)
         self.assertEqual(account.balance, Decimal("0.00"))
@@ -64,10 +64,13 @@ class AccountTests(DatabaseTestCase):
         missing = self.client.get("/accounts/2147483647", headers=other_headers)
         self.assertEqual(response.json(), missing.json())
 
-    def test_second_account_is_rejected(self):
-        self.assertEqual(self.create().status_code, 201)
+    def test_multiple_accounts_are_bounded_and_first_is_primary(self):
+        for index in range(4):
+            result = self.create()
+            self.assertEqual(result.status_code, 201)
+            self.assertEqual(result.json()["is_primary"], index == 0)
         self.assertEqual(self.create().status_code, 409)
-        self.assertEqual(len(self.client.get("/accounts", headers=self.headers).json()), 1)
+        self.assertEqual(len(self.client.get("/accounts", headers=self.headers).json()), 4)
 
     def test_client_cannot_supply_private_fields_or_invalid_bank(self):
         for extra in [{"user_id": 999}, {"balance": "1000.00"}, {"account_number": "SIM123"}, {"upi_id": "claimed@payflow"}, {"bank_name": "Real Bank"}, {}]:
@@ -104,7 +107,7 @@ class AccountTests(DatabaseTestCase):
         account = self.db.get(BankAccount, created["id"])
         other = self.other_user()
         base = dict(user_id=other.id, bank_name=DemoBank.RIVER.value, account_number="SIM9876543210123456", upi_id="constraint-test@payflow", balance=Decimal("0.00"))
-        for change in [{"user_id": self.user_id}, {"account_number": account.account_number}, {"upi_id": account.upi_id}, {"balance": Decimal("-0.01")}, {"bank_name": "Invalid"}, {"user_id": 2147483647}, {"bank_name": None}]:
+        for change in [{"user_id": self.user_id, "is_primary": True}, {"account_number": account.account_number}, {"upi_id": account.upi_id}, {"balance": Decimal("-0.01")}, {"bank_name": "Invalid"}, {"user_id": 2147483647}, {"bank_name": None}]:
             with self.subTest(field=list(change)):
                 with self.assertRaises(IntegrityError):
                     with self.db.begin_nested():
@@ -146,8 +149,8 @@ class AccountTests(DatabaseTestCase):
         self.assertNotIn(first.account_number, response.text)
 
     @unittest.skipUnless(os.getenv("REGISTER_TEST_POSTGRES") == "1", "PostgreSQL unique constraint")
-    def test_duplicate_after_precheck_is_rejected_by_database(self):
-        self.assertEqual(self.create().status_code, 201)
-        with patch.object(self.db, "scalar", return_value=None):
-            response = self.create()
-        self.assertEqual(response.status_code, 409)
+    def test_duplicate_primary_is_rejected_by_database(self):
+        self.create()
+        with self.assertRaises(IntegrityError), self.db.begin_nested():
+            self.db.execute(BankAccount.__table__.insert().values(user_id=self.user_id, bank_name=DemoBank.RIVER.value,
+                account_number="SIM9999888877776666", upi_id="duplicate-primary@payflow", is_primary=True))

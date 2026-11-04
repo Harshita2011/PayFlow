@@ -22,10 +22,8 @@ from payment_support import PaymentDatabaseTestCase  # noqa: E402
 
 def snapshot():
     engine = create_engine(DATABASE_URL, connect_args={"connect_timeout": 5})
-    names = ["users", "bank_accounts", "payments", "ledger_accounts", "ledger_entries",
-             "payment_requests", "recipient_lookup_limits", "alembic_version",
-             "contacts", "money_requests", "request_creation_limits"]
     with engine.connect() as connection:
+        names = inspect(connection).get_table_names()
         result = {name: hashlib.sha256(json.dumps(sorted(connection.execute(
             text(f"SELECT row_to_json(t)::text FROM {name} t")
         ).scalars())).encode()).hexdigest() for name in names if inspect(connection).has_table(name)}

@@ -12,9 +12,11 @@ from sqlalchemy.orm import Session
 from database import get_db
 from models import BankAccount, User
 from payment_models import LedgerEntry, Payment, PaymentRequest
-from payment_schemas import FundingRequest, PaymentHistory, PaymentReceipt, RecipientRequest, RecipientResponse, TransferRequest
+from payment_schemas import DemoFundingRequest, FundingRequest, SelfTransferRequest, PaymentHistory, PaymentReceipt, RecipientRequest, RecipientResponse, TransferRequest
 from security import get_current_user
 from social_models import MoneyRequest
+from accounts import lock_account_config
+from split_service import lock_linked_split, linked_request_is_current, settle_if_paid
 
 router = APIRouter(tags=["Simulated payments"])
 FUNDING_AMOUNT = Decimal("1000.00")
@@ -24,19 +26,24 @@ FUNDING_LIMIT = 3
 def receipt(payment: Payment, viewer_account_id: int) -> PaymentReceipt:
     incoming = payment.recipient_account_id == viewer_account_id and payment.sender_account_id != viewer_account_id
     funding = payment.type == "DEMO_FUNDING"
+    self_transfer = payment.type == "SELF_TRANSFER"
     return PaymentReceipt(
         transaction_id=payment.id, type=payment.type, status=payment.status,
-        direction="FUNDING" if funding else "INCOMING" if incoming else "OUTGOING",
+        direction="SELF" if self_transfer else "FUNDING" if funding else "INCOMING" if incoming else "OUTGOING",
         amount=payment.amount,
-        counterparty_name=payment.sender_name if incoming else payment.recipient_name,
+        counterparty_name="Transfer between your accounts" if self_transfer else payment.sender_name if incoming else payment.recipient_name,
         counterparty_upi_id=payment.sender_upi_id if incoming else payment.recipient_upi_id,
         recipient_upi_id=payment.recipient_upi_id, note=payment.note,
         failure_reason=payment.failure_reason, created_at=payment.created_at,
+        source_bank=payment.sender_account.bank_name if self_transfer else None,
+        source_masked_account="SIM •••• •••• •••• " + payment.sender_account.account_number[-4:] if self_transfer else None,
+        destination_bank=payment.recipient_account.bank_name if self_transfer else None,
+        destination_masked_account="SIM •••• •••• •••• " + payment.recipient_account.account_number[-4:] if self_transfer else None,
     )
 
 
 def own_account(db: Session, user_id: int) -> BankAccount:
-    account = db.scalar(select(BankAccount).where(BankAccount.user_id == user_id))
+    account = db.scalar(select(BankAccount).where(BankAccount.user_id == user_id, BankAccount.is_primary.is_(True)))
     if account is None:
         raise HTTPException(status_code=404, detail="Create a simulated bank account first")
     return account
@@ -44,15 +51,7 @@ def own_account(db: Session, user_id: int) -> BankAccount:
 
 @router.post("/payments/resolve", response_model=RecipientResponse)
 def resolve_recipient(payload: RecipientRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    attempts = db.execute(text("""INSERT INTO recipient_lookup_limits(user_id, window_start, attempts)
-        VALUES (:uid, date_trunc('minute', clock_timestamp()), 1)
-        ON CONFLICT (user_id) DO UPDATE SET window_start=EXCLUDED.window_start,
-        attempts=CASE WHEN recipient_lookup_limits.window_start=EXCLUDED.window_start
-          THEN LEAST(recipient_lookup_limits.attempts+1,11) ELSE 1 END RETURNING attempts"""), {"uid": user.id}).scalar_one()
-    # Count misses as well as hits, across API workers. This is not a money-changing request.
-    db.commit()
-    if attempts > 10:
-        raise HTTPException(status_code=429, detail="Too many recipient lookups. Try again next minute", headers={"Retry-After": "60"})
+    charge_lookup(db, user.id)
     found = db.execute(select(BankAccount, User.full_name).join(User, User.id == BankAccount.user_id).where(BankAccount.upi_id == payload.upi_id)).first()
     if found is None:
         raise HTTPException(status_code=404, detail="Recipient not available")
@@ -62,9 +61,21 @@ def resolve_recipient(payload: RecipientRequest, user: User = Depends(get_curren
     return RecipientResponse(display_name=name, bank_name=account.bank_name, upi_id=account.upi_id)
 
 
-def request_fingerprint(kind: str, payload: FundingRequest | TransferRequest) -> str:
-    data = payload.model_dump(mode="json")
-    if kind == "TRANSFER":
+def charge_lookup(db, user_id, cost=1):
+    attempts = db.execute(text("""INSERT INTO recipient_lookup_limits(user_id, window_start, attempts)
+        VALUES (:uid, date_trunc('minute', clock_timestamp()), :cost)
+        ON CONFLICT (user_id) DO UPDATE SET window_start=EXCLUDED.window_start,
+        attempts=CASE WHEN recipient_lookup_limits.window_start=EXCLUDED.window_start
+          THEN LEAST(recipient_lookup_limits.attempts+:cost,11) ELSE :cost END RETURNING attempts"""), {"uid": user_id, "cost": cost}).scalar_one()
+    # Count misses as well as hits, across API workers. This is not a money-changing request.
+    db.commit()
+    if attempts > 10:
+        raise HTTPException(status_code=429, detail="Too many recipient lookups. Try again next minute", headers={"Retry-After": "60"})
+
+
+def request_fingerprint(kind: str, payload: FundingRequest | TransferRequest | SelfTransferRequest) -> str:
+    data = payload.model_dump(mode="json", exclude_none=True)
+    if kind in {"TRANSFER", "SELF_TRANSFER"}:
         data["amount"] = format(payload.amount, ".2f")
     return hashlib.sha256(json.dumps({"type": kind, **data}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -78,7 +89,7 @@ def post_ledger(db: Session, payment: Payment):
     db.flush()
 
 
-def execute_payment(db: Session, user: User, key: str, kind: str, payload: FundingRequest | TransferRequest, *, money_request_id: str | None = None):
+def execute_payment(db: Session, user: User, key: str, kind: str, payload: FundingRequest | TransferRequest | SelfTransferRequest, *, money_request_id: str | None = None):
     fingerprint = request_fingerprint(kind, payload)
     if money_request_id:
         fingerprint = hashlib.sha256(f"collect:{money_request_id}:{fingerprint}".encode()).hexdigest()
@@ -105,7 +116,9 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Fundi
             return JSONResponse(status_code=status, content=body)
 
         collect = None
+        split = None
         if money_request_id:
+            split = lock_linked_split(db, money_request_id)
             # Global order: scoped retry key -> collect row -> sorted account rows.
             # Cancel/decline take only this collect row, never an account or retry-key lock.
             collect = db.scalar(select(MoneyRequest).where(MoneyRequest.id == money_request_id,
@@ -115,20 +128,26 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Fundi
             if collect.status == "PAID":
                 original = db.get(Payment, collect.payment_id)
                 return finish_collect(201, receipt(original, original.sender_account_id).model_dump(mode="json"))
+            if split and (split.status != "OPEN" or not linked_request_is_current(db, money_request_id)):
+                return finish_collect(409, {"detail": "This split contribution is no longer payable"})
             now = db.scalar(select(func.clock_timestamp()))
             if collect.status == "PENDING" and collect.expires_at <= now:
                 collect.status, collect.updated_at = "EXPIRED", now
             if collect.status != "PENDING":
                 return finish_collect(409, {"detail": "Request is no longer pending or has expired"})
 
-        sender = db.scalar(select(BankAccount).where(BankAccount.user_id == user_id))
+        lock_account_config(db, user_id)
+        source_id = getattr(payload, "source_account_id", None) or (getattr(payload, "account_id", None) if kind == "DEMO_FUNDING" else None)
+        sender = db.scalar(select(BankAccount).where(BankAccount.user_id == user_id,
+            BankAccount.id == source_id if source_id is not None else BankAccount.is_primary.is_(True)))
         if sender is None:
-            request.http_status = 404
-            request.response_body = {"detail": "Create a simulated bank account first"}
-            db.commit()
-            return JSONResponse(status_code=404, content=request.response_body)
-
-        target = sender if kind == "DEMO_FUNDING" else db.scalar(select(BankAccount).where(BankAccount.upi_id == payload.upi_id))
+            return finish_collect(404, {"detail": "Account not found" if source_id else "Create a simulated bank account first"})
+        if kind == "SELF_TRANSFER":
+            target = db.scalar(select(BankAccount).where(BankAccount.id == payload.destination_account_id, BankAccount.user_id == user_id))
+            if target is None:
+                return finish_collect(404, {"detail": "Account not found"})
+        else:
+            target = sender if kind == "DEMO_FUNDING" else db.scalar(select(BankAccount).where(BankAccount.upi_id == payload.upi_id))
         ids = sorted({sender.id} | ({target.id} if target else set()))
         # Refresh cached ORM state after waiting for locks. Lock order is shared by all payments.
         locked = {a.id: a for a in db.scalars(select(BankAccount).where(BankAccount.id.in_(ids))
@@ -152,7 +171,9 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Fundi
                 reason, error_status = "Demo funding limit reached (3 actions per user)", 429
         elif target is None:
             reason, error_status = "Recipient not available", 404
-        elif target.id == sender.id:
+        elif kind == "SELF_TRANSFER" and target.id == sender.id:
+            reason = "Choose two different accounts"
+        elif kind == "TRANSFER" and target.user_id == user_id:
             reason = "You cannot pay yourself"
         elif sender.balance < amount:
             reason = "Insufficient simulated funds"
@@ -160,26 +181,30 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Fundi
             reason = "Recipient balance limit reached"
 
         payment = Payment(
-            actor_user_id=user_id, sender_account_id=sender.id if kind == "TRANSFER" else None,
+            actor_user_id=user_id, sender_account_id=sender.id if kind != "DEMO_FUNDING" else None,
             recipient_account_id=target.id if target else None, amount=amount, currency="INR",
             type=kind, status="FAILED" if reason else "SUCCESS",
-            sender_upi_id=sender.upi_id if kind == "TRANSFER" else None,
+            sender_upi_id=sender.upi_id if kind != "DEMO_FUNDING" else None,
             recipient_upi_id=target.upi_id if target else payload.upi_id,
-            sender_name=user.full_name if kind == "TRANSFER" else "PayFlow demo funding",
+            sender_name=user.full_name if kind != "DEMO_FUNDING" else "PayFlow demo funding",
             recipient_name=target.owner.full_name if target else "Unavailable recipient",
-            note=payload.note if kind == "TRANSFER" else "Fictional test funds",
+            note=payload.note if kind != "DEMO_FUNDING" else "Fictional test funds",
             failure_reason=reason,
         )
+        payment.sender_account = sender if kind != "DEMO_FUNDING" else None
+        payment.recipient_account = target
         db.add(payment)
         db.flush()
         if not reason:
-            if kind == "TRANSFER":
+            if kind != "DEMO_FUNDING":
                 sender.balance -= amount
             target.balance += amount
             post_ledger(db, payment)
             if collect:
                 posted_at = db.scalar(select(func.clock_timestamp()))
                 collect.status, collect.payment_id, collect.updated_at = "PAID", payment.id, posted_at
+        if collect and not reason:
+            settle_if_paid(db, split)
         public = receipt(payment, sender.id).model_dump(mode="json")
         request.payment_id = payment.id
         request.http_status = error_status if reason else 201
@@ -197,7 +222,7 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Fundi
 
 
 @router.post("/demo/fund", response_model=PaymentReceipt, status_code=201)
-def fund(payload: FundingRequest, idempotency_key: UUID = Header(), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def fund(payload: DemoFundingRequest, idempotency_key: UUID = Header(), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     return execute_payment(db, user, str(idempotency_key), "DEMO_FUNDING", payload)
 
 
@@ -206,29 +231,33 @@ def transfer(payload: TransferRequest, idempotency_key: UUID = Header(), user: U
     return execute_payment(db, user, str(idempotency_key), "TRANSFER", payload)
 
 
-def visible_to(account_id: int):
-    # Failed payments belong to their initiator; an unpaid recipient sees no incoming money.
-    return or_(Payment.sender_account_id == account_id,
-        (Payment.recipient_account_id == account_id) & ((Payment.status == "SUCCESS") | (Payment.type == "DEMO_FUNDING")))
+@router.post("/payments/self-transfer", response_model=PaymentReceipt, status_code=201)
+def self_transfer(payload: SelfTransferRequest, idempotency_key: UUID = Header(), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return execute_payment(db, user, str(idempotency_key), "SELF_TRANSFER", payload)
+
+
+def visible_to(account_ids):
+    return or_(Payment.sender_account_id.in_(account_ids),
+        Payment.recipient_account_id.in_(account_ids) & ((Payment.status == "SUCCESS") | (Payment.type == "DEMO_FUNDING")))
 
 
 @router.get("/payments/history", response_model=PaymentHistory)
 def history(limit: int = Query(10, ge=1, le=50), before: UUID | None = None, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    account = own_account(db, user.id)
-    query = select(Payment).where(visible_to(account.id))
+    account_ids = list(db.scalars(select(BankAccount.id).where(BankAccount.user_id == user.id)))
+    query = select(Payment).where(visible_to(account_ids))
     if before:
-        cursor = db.scalar(select(Payment).where(Payment.id == str(before), visible_to(account.id)))
+        cursor = db.scalar(select(Payment).where(Payment.id == str(before), visible_to(account_ids)))
         if cursor is None:
             raise HTTPException(status_code=404, detail="Payment not found")
         query = query.where(tuple_(Payment.created_at, Payment.id) < (cursor.created_at, cursor.id))
     rows = list(db.scalars(query.order_by(Payment.created_at.desc(), Payment.id.desc()).limit(limit + 1)))
-    return PaymentHistory(items=[receipt(p, account.id) for p in rows[:limit]], next_cursor=rows[limit-1].id if len(rows) > limit else None)
+    return PaymentHistory(items=[receipt(p, p.recipient_account_id if p.recipient_account_id in account_ids else p.sender_account_id) for p in rows[:limit]], next_cursor=rows[limit-1].id if len(rows) > limit else None)
 
 
 @router.get("/payments/{transaction_id}", response_model=PaymentReceipt)
 def get_receipt(transaction_id: UUID, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    account = own_account(db, user.id)
-    payment = db.scalar(select(Payment).where(Payment.id == str(transaction_id), visible_to(account.id)))
+    account_ids = list(db.scalars(select(BankAccount.id).where(BankAccount.user_id == user.id)))
+    payment = db.scalar(select(Payment).where(Payment.id == str(transaction_id), visible_to(account_ids)))
     if payment is None:
         raise HTTPException(status_code=404, detail="Payment not found")
-    return receipt(payment, account.id)
+    return receipt(payment, payment.recipient_account_id if payment.recipient_account_id in account_ids else payment.sender_account_id)

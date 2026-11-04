@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
-import { ApiError, createAccount, getAccounts, getDemoBanks } from './api'
+import { ApiError, createAccount, getAccounts, getDemoBanks, setPrimaryAccount } from './api'
 import type { BankAccount } from './api'
 import PaymentPanel from './PaymentPanel'
-import CopyUpi from './CopyUpi'
+import BankAccountCard from './BankAccountCard'
 import type { DashboardView } from './navigation'
 import { formatMoney } from './formatMoney'
+import { minorUnits } from './moneyInput'
 
 interface Props {
   token: string
@@ -15,7 +16,13 @@ interface Props {
 }
 
 export default function AccountPanel({ token, onLogout, view = 'all', onNavigate }: Props) {
-  const [account, setAccount] = useState<BankAccount | null>(null)
+  const [accounts, setAccounts] = useState<BankAccount[]>([])
+  const [selectedId, setSelectedId] = useState<number | null>(null)
+  const [paymentsLocked, setPaymentsLocked] = useState(false)
+  const account = accounts.find((item) => item.id === selectedId) || accounts.find((item) => item.is_primary) || accounts[0] || null
+  const anchorId = accounts.length ? Math.min(...accounts.map((item) => item.id)) : 0
+  const totalPaise = accounts.reduce((sum, item) => sum + minorUnits(item.balance), 0n)
+  const totalBalance = `${totalPaise / 100n}.${String(totalPaise % 100n).padStart(2, '0')}`
   const [banks, setBanks] = useState<string[]>([])
   const [loading, setLoading] = useState(true)
   const [creating, setCreating] = useState(false)
@@ -31,7 +38,7 @@ export default function AccountPanel({ token, onLogout, view = 'all', onNavigate
     Promise.all([getAccounts(token), getDemoBanks(token)])
       .then(([accounts, choices]) => {
         if (!active) return
-        if (revision === balanceRevision.current) setAccount(accounts[0] ?? null)
+        if (revision === balanceRevision.current) setAccounts(accounts)
         setBanks(choices)
       })
       .catch((failure: unknown) => {
@@ -43,12 +50,12 @@ export default function AccountPanel({ token, onLogout, view = 'all', onNavigate
         }
       })
       .finally(() => { if (active) setLoading(false) })
-    return () => { active = false; generation.current += 1 }
+      return () => { active = false; generation.current += 1 }
   }, [token, onLogout, reload])
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (creating) return
+    if (creating || paymentsLocked) return
     const bank = String(new FormData(event.currentTarget).get('bank_name') || '')
     if (!banks.includes(bank)) { setError('Choose a demo bank.'); return }
     const current = generation.current
@@ -58,7 +65,8 @@ export default function AccountPanel({ token, onLogout, view = 'all', onNavigate
     try {
       const created = await createAccount(token, bank)
       if (current !== generation.current) return
-      setAccount(created)
+      setAccounts((old) => [...old, created])
+      setSelectedId(created.id)
       setSuccess('Your simulated account and UPI ID are ready.')
     } catch (failure) {
       if (current !== generation.current) return
@@ -84,7 +92,24 @@ export default function AccountPanel({ token, onLogout, view = 'all', onNavigate
     const current = generation.current
     const revision = ++balanceRevision.current
     const accounts = await getAccounts(token)
-    if (current === generation.current && revision === balanceRevision.current) setAccount(accounts[0] ?? null)
+    if (current === generation.current && revision === balanceRevision.current) setAccounts(accounts)
+  }
+
+  async function makePrimary(id: number) {
+    if (paymentsLocked || creating) return
+    const current = generation.current
+    setCreating(true); setError('')
+    try {
+      await setPrimaryAccount(token, id)
+      if (current !== generation.current) return
+      await refreshBalance()
+      if (current === generation.current) { setSelectedId(id); setSuccess('Primary account updated. Existing UPI destinations are unchanged.') }
+    } catch (failure) {
+      if (current === generation.current) {
+        if (failure instanceof ApiError && failure.status === 401) onLogout('Your session has expired. Please sign in again.')
+        else setError(failure instanceof Error ? failure.message : 'Could not change primary account.')
+      }
+    } finally { if (current === generation.current) setCreating(false) }
   }
 
   return (
@@ -98,18 +123,7 @@ export default function AccountPanel({ token, onLogout, view = 'all', onNavigate
         {error && <p role="alert" className="feedback error">{error} Use Refresh accounts to check the latest state.</p>}
         {success && <p role="status" className="feedback success">{success}</p>}
         {account ? (
-          <article className="bank-card" aria-label="Simulated bank account">
-            <div className="bank-card-heading"><span>{account.bank_name}</span><span className="demo-tag">SIMULATED</span></div>
-            <p className="balance-label">Demo balance · INR</p>
-            {/* Keep the exact decimal string; do not convert it with Number/parseFloat. */}
-            <p className="account-balance">{formatMoney(account.balance)}</p>
-            <dl className="account-details">
-              <div><dt>Account number</dt><dd>{account.masked_account_number}</dd></div>
-              <div><dt>UPI ID · PayFlow sandbox only</dt><dd>{account.upi_id}</dd></div>
-            </dl>
-            <CopyUpi upiId={account.upi_id} />
-            <p className="bank-disclaimer">Fictional funds. No real bank or UPI connection.</p>
-          </article>
+          <div className="account-cards">{(view === 'account' ? accounts : [account]).map((item) => <BankAccountCard key={item.id} account={item} busy={creating || paymentsLocked} onPrimary={view === 'account' ? () => makePrimary(item.id) : undefined} />)}</div>
         ) : banks.length > 0 && (
           <div className="account-empty">
             <p className="empty-title">A fresh start for your payment sandbox.</p>
@@ -120,12 +134,15 @@ export default function AccountPanel({ token, onLogout, view = 'all', onNavigate
                 <button className="primary-button" type="submit">{creating ? 'Creating demo account…' : 'Create demo account'}<span aria-hidden="true">↗</span></button>
               </fieldset>
             </form>
-            <p className="account-note">One simulated account per person. Only fictional money is used.</p>
+            <p className="account-note">Up to four demo accounts. Funding allowance stays shared across your accounts.</p>
           </div>
         )}
       </>}
       </div>
-      {account && <PaymentPanel key={account.id} token={token} accountId={account.id} senderAccount={account} onLogout={onLogout} onBalanceChanged={refreshBalance} view={view} onNavigate={onNavigate} />}
+      {account && view === 'home' && accounts.length > 1 && <p className="wallet-total">Total across your accounts · <strong>{formatMoney(totalBalance)}</strong> simulated INR</p>}
+      {account && accounts.length > 1 && ['home', 'account', 'send', 'requests', 'splits', 'qr', 'all'].includes(view) && <label className="source-account-picker">Source account<select value={account.id} disabled={paymentsLocked || creating} onChange={(event) => setSelectedId(Number(event.target.value))}>{accounts.map((item) => <option key={item.id} value={item.id}>{item.bank_name} · {item.masked_account_number} · {formatMoney(item.balance)}{item.is_primary ? ' · Primary' : ''}</option>)}</select></label>}
+      {account && view === 'account' && accounts.length < 4 && <form className="surface add-account" aria-label="Add simulated bank account" onSubmit={submit}><h4>Add a fictional account</h4><p className="account-note">Starts at zero. Your three funding actions remain user-wide.</p><fieldset disabled={creating || paymentsLocked}><label>Demo bank<select name="bank_name" required defaultValue=""><option value="" disabled>Choose a demo bank</option>{banks.map((bank) => <option key={bank}>{bank}</option>)}</select></label><button className="primary-button" type="submit">{creating ? 'Adding account…' : 'Add demo account'}</button></fieldset></form>}
+      {account && <PaymentPanel key={anchorId} token={token} accountId={anchorId} sourceAccountId={account.id} accounts={accounts} onLockChanged={setPaymentsLocked} senderAccount={account} onLogout={onLogout} onBalanceChanged={refreshBalance} view={view} onNavigate={onNavigate} />}
     </section>
   )
 }

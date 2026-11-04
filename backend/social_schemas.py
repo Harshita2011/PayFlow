@@ -2,7 +2,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, field_serializer
+from pydantic import BaseModel, ConfigDict, field_serializer, model_validator
 
 from payment_schemas import RecipientRequest, TransferRequest
 
@@ -34,6 +34,12 @@ class RecentContact(PublicPerson):
 
 class MoneyRequestCreate(TransferRequest):
     """Same exact decimal, note, UPI and maximum amount rules as transfers."""
+
+    @model_validator(mode="after")
+    def no_source_override(self):
+        if self.source_account_id is not None:
+            raise ValueError("Request creation does not select the payer's account")
+        return self
 
 
 class MoneyRequestResponse(BaseModel):

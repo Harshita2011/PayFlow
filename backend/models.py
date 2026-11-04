@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, Numeric, String, UniqueConstraint, text
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, Numeric, String, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database import Base
@@ -38,8 +38,8 @@ class User(Base):
         nullable=False
     )
 
-    bank_account: Mapped["BankAccount | None"] = relationship(
-        back_populates="owner", uselist=False, passive_deletes=True
+    bank_accounts: Mapped[list["BankAccount"]] = relationship(
+        back_populates="owner", passive_deletes=True
     )
 
 
@@ -52,7 +52,9 @@ class DemoBank(str, Enum):
 class BankAccount(Base):
     __tablename__ = "bank_accounts"
     __table_args__ = (
-        UniqueConstraint("user_id", name="uq_bank_accounts_user_id"),
+        Index("ix_bank_accounts_user", "user_id", "id"),
+        Index("uq_bank_accounts_primary", "user_id", unique=True,
+              postgresql_where=text("is_primary"), sqlite_where=text("is_primary")),
         UniqueConstraint("account_number", name="uq_bank_accounts_account_number"),
         UniqueConstraint("upi_id", name="uq_bank_accounts_upi_id"),
         CheckConstraint(
@@ -85,8 +87,9 @@ class BankAccount(Base):
         Numeric(18, 2), default=Decimal("0.00"), server_default=text("0.00"),
         nullable=False,
     )
+    is_primary: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
         server_default=text("CURRENT_TIMESTAMP"), nullable=False,
     )
-    owner: Mapped[User] = relationship(back_populates="bank_account")
+    owner: Mapped[User] = relationship(back_populates="bank_accounts")

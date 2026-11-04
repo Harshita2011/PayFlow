@@ -24,7 +24,7 @@ async function createUser(page, name, bank) {
   // Guard this script against accidentally creating persistent development payments.
   await page.route('**/*', async (route) => {
     const request = route.request()
-    if (['POST', 'PATCH', 'DELETE'].includes(request.method()) && /\/(register|login|accounts|contacts|payment-requests|demo\/fund|payments\/)/.test(request.url())) {
+    if (['POST', 'PATCH', 'DELETE'].includes(request.method()) && /\/(register|login|accounts|contacts|payment-requests|splits|demo\/fund|payments\/)/.test(request.url())) {
       if (!request.url().startsWith('http://127.0.0.1:18016/')) {
         await route.abort()
         throw new Error('QA must use isolated API :18016; request blocked before sending')

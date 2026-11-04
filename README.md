@@ -1,4 +1,4 @@
-# PayFlow — Phase 7 contacts and request money
+# PayFlow — Phase 8 split expenses and self bank transfers
 
 PayFlow is a local UPI payment **simulation** for learning. Phase 2 provides
 registration → login → JWT access token → protected profile → client-side logout.
@@ -12,6 +12,8 @@ UPI networks, NPCI requests, or real money. Phase 6 refines the frontend with a
 blue design system, responsive navigation, and focused screens using these same APIs.
 Phase 7 adds personal saved contacts, favorites, derived recent contacts, and
 explicitly confirmed money requests using the existing atomic payment engine.
+Phase 8 adds expense obligations, up to four fictional accounts per user,
+primary/source selection and self-transfers through that same ledger engine.
 
 ## Run locally (PowerShell)
 
@@ -60,7 +62,348 @@ configuration: never put a signing key or database credentials there.
 Use Ctrl+C in each terminal to stop its server. If an older server is already
 running, stop that server and restart it to load the new dependencies/settings.
 
-## Phase 7 — Contacts, recent people and request money
+## Phase 8 — Split expenses, multiple accounts and self transfers
+
+All money is still fictional. Creating an expense records obligations only;
+paying a contribution and transferring between your own accounts use the original
+atomic payment engine. No real bank, UPI network, recharge or payment service is used.
+
+### Expense model and exact allocation
+
+Every expense is an **externally paid expense record**, not a verified PayFlow
+bill payment. The form explicitly acknowledges this. The creator's included share
+is `CREATOR_SHARE`, is accounted for in the expense total, and creates neither a
+self-request nor a debit. Other people owe contributions to the creator. Excluding
+the creator means the full total is allocated to the selected other people.
+
+Splits support one to ten other people, with **at most ten people including the
+creator**, and total ₹0.01–₹100,000. Every included share must be at least one
+paise; remove a person rather than entering a zero share. There must be at least
+one other person. Users need existing simulated accounts, and the same user
+cannot appear twice even under different account UPI IDs.
+
+Equal allocation uses integer paise. The creator, when included, receives the
+first remainder paise; other people are ordered by normalized UPI ID. For ₹100
+among three people this produces **₹33.34, ₹33.33, ₹33.33**. Custom shares must be
+positive exact decimal strings and sum exactly to the total. The frontend offers
+a BigInt preview; the backend independently resolves users and calculates/checks
+every allocation using Decimal/integer paise. It does not accept a client-calculated
+equal-share total as authority.
+
+### Split schema and shared obligation lifecycle
+
+| Table | Responsibility |
+| --- | --- |
+| `expense_splits` | Creator, immutable title/description/total, INR, fixed `EXTERNAL_RECORD` model, pinned destination account, `OPEN`/`SETTLED`/`CANCELLED`, creation key/fingerprint and timestamps. |
+| `expense_split_participants` | Unique split/user pair, positive immutable share and the current nullable money-request link. The creator has no request. |
+| `split_request_links` | Unique request → participant association, retaining every renewal attempt immutably. A request cannot belong to two obligations. |
+| `money_request_destinations` | Immutable request → destination account mapping. Existing Phase 7 requests are pinned to their existing account without updating their original request rows. |
+
+**There is no split-payment endpoint or second balance updater.** Each owed share
+creates one Phase 7 `money_requests` row with note `Split: <title>`. Both My Splits
+and Requests pay that same request through `POST /payment-requests/{id}/pay`.
+The request's PAID/payment link, the original transfer/ledger posting, and final
+split settlement are coordinated in a single PostgreSQL transaction. Participant
+status and receipt are derived from that linked request; there is no independently
+editable paid flag that can drift.
+
+The server derives total expense, creator share, contributions received and
+outstanding amount. `SETTLED` requires every non-creator contribution PAID.
+Declined, cancelled or expired requests remain unpaid and leave the split OPEN.
+The creator may renew a closed unpaid request: the old request is permanently
+unpayable, a fresh request replaces the current link atomically, and the old link
+remains in settlement history. A unique renewal key makes retries safe. Pending
+or paid requests cannot be renewed, and a cancelled/settled split cannot reopen.
+
+A creator can cancel a split only if **no contribution has been paid**. Cancellation
+closes all current pending requests atomically. It never cancels a committed payment,
+automatically refunds anyone, erases history or edits shares. The UI labels amounts
+on a cancelled split as uncollected rather than actively requested.
+
+Database triggers enforce immutable expense/share terms, exact share sums,
+creator/request ownership, pinned destinations, valid current/history links and
+settlement consistency. Group members see names, public UPI IDs, shares and status;
+only the creator and designated payer receive a share's private request/receipt
+identifiers and request-attempt history. Existing receipt authorization still applies.
+
+### Multiple accounts, primary selection and routing
+
+Users may have **up to four demo accounts**, each with its own unique server-generated
+SIM number and account-scoped @payflow ID. All existing numbers, UPI IDs, balances,
+account IDs and payment references are preserved. Additional accounts start at zero.
+
+- A partial unique index guarantees at most one primary per user; a deferred
+  constraint requires exactly one for users with accounts. The first account is
+  primary, and existing one-account users were backfilled as primary.
+- Primary switching locks the user's account configuration and account rows,
+  clears the old flag, sets the new flag, and commits atomically. Ownership and
+  the four-account limit are enforced on the backend; account identity and UPI
+  routing are immutable.
+- The **primary is the default source**, not a redirect for old UPI IDs. Every
+  exact UPI address and its QR always credits the account that originally owns it.
+  A new primary never silently reroutes an old address.
+- New money requests and splits pin the creator/requester's current primary
+  destination at creation. Later primary changes do not reroute outstanding requests.
+- Transfers and request payments can select any owned source account. Source
+  selection is explicit in new UI payment payloads and is saved with the retry intent.
+  Legacy requests without a source continue to use the primary at execution.
+- My QR shows the selected account's public ID. Switching accounts hides the old
+  QR/download until a code for the new ID is ready, keeping code and readable text coherent.
+- Contacts remain user-scoped and show a current primary public identity. Recent
+  contacts deduplicate counterpart users across all their accounts. Self transfers
+  do not appear as recent people.
+
+Funding is still **₹1,000 per action, three successful actions per user for the
+life of this demo**, counted from existing funding history across all accounts.
+Opening more accounts or changing primary cannot reset the budget. Funding takes
+the same per-user configuration lock, so simultaneous funding into different
+accounts cannot bypass the limit. Legacy opening balances are preserved as before.
+
+### Self-transfer engine, history and concurrency
+
+`POST /payments/self-transfer` accepts two distinct owned account IDs, an exact
+decimal-string amount and optional note. JWT identity determines the owner. Both
+accounts are checked on the backend; an unrelated account returns safe 404.
+Normal UPI transfers to any of your own accounts remain rejected—use Transfer to Self.
+
+The existing `execute_payment` reserves the scoped idempotency key, takes the
+actor's configuration lock, then locks the two accounts in ascending ID order.
+It checks funds while locked, debits and credits once, calls the same `post_ledger`,
+checks the same deferred invariants, and commits once. Failures roll back all sides.
+`SELF_TRANSFER` is a new payment type; no old payment row was relabelled or changed.
+Self receipts include both fictional bank names and masked account identifiers.
+History includes every owned account, deduplicates the self payment, labels it
+**Self Transfer**, and uses neither an income `+` nor spending `−` sign. User-wide
+funds are unchanged by a successful self transfer.
+
+For collect contributions the lock order is:
+
+1. Existing user-scoped idempotency reservation.
+2. Linked split row, if any.
+3. Money-request row.
+4. Actor's account-configuration lock.
+5. Affected account rows in ascending account ID.
+
+Cancel/decline/renew use the same split-before-request order; they never acquire
+payment-key locks or change balances. Split cancellation holds the split lock
+before inspecting contributions, so it cannot race past a successful payment.
+Same/different keys for an already-paid share return its original receipt. A
+renewed old request stays terminal. Source/destination/amount changes with the
+same self-transfer key return 409. New optional source fields are excluded when
+unset from fingerprints, preserving pre-Phase-8 retry fingerprints.
+
+The existing account-scoped retry metadata is anchored to the user's oldest
+account, not whichever card is selected. Changing source or primary cannot
+remount away a payment or create a replacement retry key. Unknown outcomes retain
+the original body, source/destination IDs and UUID across refresh/relogin in the
+same tab. Controls prevent another payment or source change until recovery.
+
+### Migrations and data preservation
+
+- **`0005_expense_splits`** adds split/participant/history tables and immutable
+  request destinations. It backfills destination mappings with INSERTs; it does
+  not rewrite existing money requests, payments or ledger entries.
+- **`0006_multiple_accounts`** adds/backfills `bank_accounts.is_primary`, adapts
+  only the one-account uniqueness restriction, adds primary/cardinality/identity
+  guards and extends payment-type/ownership constraints for self transfers.
+
+Both migrations are transactional and forward-only. Financial triggers are
+never disabled. Deferred invariants are checked before schema/index DDL, including
+when a legacy database has positive balances and paid requests. Tests staged a
+Phase 7 paid request and real balanced postings, upgraded, and compared every old
+record field. Actual development migration hashes likewise confirmed existing
+fields unchanged, except the intended new primary metadata. No test expenses,
+accounts or payments were added to development data.
+
+Extended read-only `reconcile.py` checks ledger/cache balances, self-transfer
+ownership/user-net conservation, pinned paid-request links, split settlement and
+one-primary/four-account invariants. It never repairs records automatically.
+
+### New and changed API contracts
+
+| Method / path | Body and behavior |
+| --- | --- |
+| `POST /splits` | Title, total decimal string, optional description, creator toggle, EQUAL/CUSTOM and participants by UPI; UUID `Idempotency-Key`; creates obligations only. |
+| `GET /splits` | Own created/participating expenses; `scope=all/created/shared/settled`, `limit` 1–50, stable `before` UUID pagination. |
+| `GET /splits/{id}` | Participant/creator-only details and server-derived totals/progress. |
+| `GET /splits/{id}/participants` | Same access restriction; participant shares. |
+| `POST /splits/{id}/cancel` | `{}`; creator only; no paid contributions permitted. |
+| `POST /splits/{id}/participants/{participant_id}/renew` | `{}` and UUID key; creator only; renew a terminal unpaid request without duplicating its obligation. |
+| `GET /accounts` | All owned accounts, primary first; adds `is_primary`. |
+| `POST /accounts` | Existing bank-only body; up to four zero-balance demo accounts. |
+| `PATCH /accounts/{id}/primary` | Set an owned primary atomically. |
+| `POST /payments/self-transfer` | `source_account_id`, `destination_account_id`, decimal-string `amount`, optional `note`, UUID key. |
+| `POST /payments/transfer` | Existing fields; optional owned `source_account_id`. |
+| `POST /payment-requests/{id}/pay` | Existing `{}` still works; optional owned `source_account_id`. Splits use this exact endpoint. |
+| `POST /demo/fund` | Existing `{}` still works; optional owned `account_id`. User-wide allowance unchanged. |
+| Payment history / receipt | Existing fields preserved; adds SELF_TRANSFER/SELF classification and optional self bank/mask fields. History covers all owned accounts. |
+
+All endpoints require JWTs; private objects return 404 to unrelated users.
+Extra balance/owner fields are rejected. Split requests share Phase 7's ten-new-
+requests/hour, twenty-active-outgoing and fifty-active-incoming caps; a split
+consumes one request per non-creator participant. Exact lookup limits still apply;
+saved contacts avoid repeatedly charging an already-known person as a fresh lookup.
+
+Example equal split body:
+
+```json
+{
+  "title": "Restaurant dinner",
+  "description": "Externally paid expense record",
+  "total_amount": "100.00",
+  "include_creator": true,
+  "mode": "EQUAL",
+  "participants": [
+    { "upi_id": "friend-one@payflow" },
+    { "upi_id": "friend-two@payflow" }
+  ]
+}
+```
+
+For CUSTOM, add `creator_share` when included and a positive `share_amount` string
+to each participant. Shares must sum exactly; EQUAL rejects supplied custom shares.
+
+```json
+{
+  "source_account_id": 1,
+  "destination_account_id": 4,
+  "amount": "700.00",
+  "note": "Move fictional funds to my other account"
+}
+```
+
+This self-transfer body requires a fresh UUID key for a new intended transfer;
+retries must retain that same key and exact body. Registration/login/API authorization
+in FastAPI `/docs` remains as documented in earlier phases below.
+
+### Frontend files and navigation
+
+| File | Responsibility |
+| --- | --- |
+| `backend/split_models.py`, `split_schemas.py` | Expense/participant/renewal-link models and strict exact-money/public schemas. |
+| `backend/splits.py`, `split_service.py` | Creation, preview verification, own lists/detail, safe cancellation/renewal and shared split/request locking. No balance shortcut. |
+| `backend/request_limits.py` | Phase 7 capacity checks shared by standalone requests and split contributions. |
+| `backend/migrations/versions/0005_expense_splits.py`, `0006_multiple_accounts.py` | Additive/preservation-focused migrations and invariants. |
+| `backend/models.py`, `accounts.py`, `account_schemas.py` | Multiple owned accounts, bounded creation, primary switching and safe output. |
+| `backend/payment_models.py`, `payment_schemas.py`, `payments.py` | Self classification, source selection, all-account history, shared atomic posting and split settlement hook. |
+| `backend/social_models.py`, `social_schemas.py`, `social.py` | Pinned request destinations, source-selected pay, primary public identities and deduplicated user recents. |
+| `backend/main.py`, `migrations/env.py`, `reconcile.py` | Router/metadata registration, no-store responses and extended read-only audits. |
+| `frontend/src/SplitPanel.tsx`, `splitApi.ts`, `splitMath.ts` | Contact/verified UPI picker, equal/custom preview, review, creation retries, filters, details, request/receipt links and settlement history. |
+| `frontend/src/SelfTransferPanel.tsx`, `BankAccountCard.tsx` | Owned account selectors, explicit self review/confirmation, reusable masked cards and primary controls. |
+| `frontend/src/AccountPanel.tsx` | All-account state, source selection and exact combined balance; stable payment-intent anchor. |
+| `frontend/src/PaymentPanel.tsx`, `api.ts`, `socialApi.ts`, `PaymentHistory.tsx` | Existing payment retry/receipt path extended for self and source-selected contributions; correct self history labels. |
+| `frontend/src/MyQrCode.tsx` | Prevents old-code/new-readable-ID mismatch while switching account identity. |
+| `frontend/src/navigation.ts`, `DashboardShell.tsx`, `App.css` | New desktop destinations and secondary Home/Profile tools; five-action mobile bottom nav retained. |
+| `backend/tests/test_phase8.py`, `test_migrations.py`, `test_accounts.py`, `payment_support.py` | Phase 8 money/ownership/concurrency coverage, old-record migration checks, intentional account-cardinality regression updates and full fixture reconciliation. |
+| `frontend/src/Phase8.test.tsx`, `QrScanner.test.tsx`, `Experience.test.tsx` | Split/self/account/primary/retry tests, coherent switched-account QR, navigation compatibility. |
+| `frontend/qa/phase8-browser.mjs`, `phase6-browser.mjs`, `isolated_backend.py` | Three-user browser QA, old QR/direct/request regressions and hashes of every development table. |
+| `README.md` | Phase 8 architecture, lifecycle, contracts, files, safety, commands and limitations. |
+
+Desktop adds Split Expenses, My Splits, My Bank Accounts and Transfer to Self.
+Home/Profile secondary tools make them reachable on mobile without adding bottom
+tabs. Splits support Created by Me, Shared with Me and Settlement History filters.
+Source selectors show only authenticated owned accounts and masked identifiers.
+Existing warnings stay red, controls have labels/focus states, confirmation is
+explicit, and native dialogs preserve Escape/focus containment. No new runtime
+dependency or external service was introduced.
+
+### Phase 8 verification and commands
+
+Executed: **116 PostgreSQL backend tests passed**, **146 React tests passed**,
+TypeScript/production build and ESLint passed; Alembic check has no schema drift.
+Tests cover the existing authentication, account, direct-payment, QR and request
+flows plus exact split allocation, unsafe cancellation, renewal, shared-obligation
+duplicate/concurrent pay, all-account ownership/routing, user-wide funding,
+self-transfer rollback/conservation/replay, primary races, privacy and legacy
+fingerprint compatibility. Every development table is hash-compared before/after
+backend tests. Reconciliation reports no errors.
+
+Real Chromium Phase 8 QA used three registered fictional users in a fresh
+`payflow_phase4_tests` schema. Asha linked a second account, changed primary and
+self-transferred ₹700 from a ₹1,000 balance. A committed-response-loss retry kept
+the same key and produced one posting: ₹300/₹700 across her accounts, total ₹1,000.
+A ₹100 three-person split allocated ₹33.34/₹33.33/₹33.33. One person paid from My
+Splits and another from Requests; the split settled once with ₹66.66 received.
+Changing the creator's primary did not reroute those outstanding requests.
+Decline/renew and unpaid cancellation worked. An original downloaded QR still
+credited the original account after another primary switch. Direct/QR and Phase 7
+browser harnesses passed too, including lost-response recovery, receipts, logout,
+and 320/390/768/1024/1440px layouts. Physical camera hardware was not retested.
+
+Normal run, separate terminals:
+
+```powershell
+cd D:\PayFLow\backend
+docker start payflow-postgres-5436
+.\.venv\Scripts\python.exe -m alembic upgrade head
+.\.venv\Scripts\python.exe -m uvicorn main:app --reload --port 8001
+```
+
+```powershell
+cd D:\PayFLow\frontend
+npm install
+npm run dev -- --port 5173 --strictPort
+```
+
+Tests and audits:
+
+```powershell
+cd D:\PayFLow\backend
+$env:REGISTER_TEST_POSTGRES = '1'
+.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v
+Remove-Item Env:REGISTER_TEST_POSTGRES
+.\.venv\Scripts\python.exe -m alembic current
+.\.venv\Scripts\python.exe -m alembic check
+.\.venv\Scripts\python.exe -B reconcile.py
+```
+
+```powershell
+cd D:\PayFLow\frontend
+npm test
+npm run build
+npm run lint
+```
+
+For data-preserving manual/browser testing, use the isolated QA server and Vite
+commands in the Phase 6 section below. They create a fresh schema at the current
+migration head. With `PLAYWRIGHT_MODULE` set to your separate Playwright tooling:
+
+```powershell
+cd D:\PayFLow\frontend
+node qa/phase8-browser.mjs
+node qa/phase6-browser.mjs
+node qa/phase7-browser.mjs
+```
+
+Manual checks on those isolated servers:
+
+1. Register A, B and C in separate profiles; create accounts and add demo funds.
+2. A adds a second bank account and explicitly sets primary. Transfer ₹700 from
+   the funded original account into it; check both balances and unchanged total.
+3. A saves B/C as contacts, creates a ₹100 equal split including A, reviews the
+   ₹33.34/₹33.33/₹33.33 allocation and confirms creation. No money moves yet.
+4. B opens Shared with Me in My Splits and explicitly pays their share. C opens
+   the same contribution in Requests and pays there. Refresh A's details: SETTLED,
+   creator external share ₹33.34, received ₹66.66, outstanding ₹0.00, linked receipts.
+5. Try cancelling after payment: it must be unavailable/rejected. On a new unpaid
+   split, decline and renew one request, then cancel another wholly unpaid split.
+   Old renewed requests remain closed, and no refunds are automatic.
+6. Change primary and scan the original QR from before account linking. Verify
+   that it still resolves to, and credits, its original account.
+
+Stop QA services with Ctrl+C for final ledger/data-preservation checks. Test
+schemas are retained, never dropped. Clear the temporary `VITE_API_BASE_URL` or
+close that shell before starting the normal frontend again.
+
+Known limitations: no editing shares, zero-share participants, automatic refunds,
+account deletion, or background expiry scheduler. Request/split activity refreshes
+on navigation/actions/manual refresh rather than live push. Original external bill
+payment is unverified by design. Small demo request/funding limits and per-actor
+serialization prioritize understandable safety over production throughput. Browser
+automation checked synthetic camera cleanup and real image decoding; physical
+phone-camera and screen-reader hardware were not tested. No Phase 9 work is included.
+
+## Phase 7 — Contacts, recent people and request money (previous phase)
 
 Three concepts stay separate:
 
@@ -363,7 +706,7 @@ Saved contacts are not mutual friends. Abuse limits are deliberately small demo
 controls; a production service would need broader abuse monitoring and operational
 controls. Physical camera and screen-reader hardware were not tested in this
 phase; existing camera tests, synthetic-media checks and real image decoding
-regressions remain covered. No Phase 8 features or real payment integration exist.
+regressions remain covered. Phase 8 now extends this functionality as described above.
 
 ## Phase 6 — Frontend experience and UI/UX (previous phase)
 
@@ -804,7 +1147,7 @@ From `D:\PayFLow\backend`:
 ```
 
 Phase 3 introduced `0002_bank_accounts`; the current head is now
-`0004_contacts_money_requests`. These migrations are applied to the configured local
+`0006_multiple_accounts`. These migrations are applied to the configured local
 database and existing records were preserved. Repeating `upgrade head` is a no-op.
 
 No manual `stamp`, database reset, or `Base.metadata.create_all()` is required.

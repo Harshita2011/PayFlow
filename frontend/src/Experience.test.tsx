@@ -57,7 +57,7 @@ describe('Phase 6 experience', () => {
     expect(screen.getByRole('heading', { name: 'Recent activity' })).toBeTruthy()
     fireEvent.click(within(nav).getByRole('button', { name: 'Transactions' }))
     expect(screen.getByRole('heading', { name: 'Payment history' })).toBeTruthy()
-    fireEvent.click(within(nav).getByRole('button', { name: 'Bank Account' }))
+    fireEvent.click(within(nav).getByRole('button', { name: 'My Bank Accounts' }))
     expect(screen.getByRole('article', { name: 'Simulated bank account' })).toBeTruthy()
     fireEvent.click(within(nav).getByRole('button', { name: 'Profile' }))
     expect(screen.getByRole('heading', { name: 'Your profile' })).toBeTruthy()

@@ -18,6 +18,7 @@ export interface BankAccount {
   upi_id: string
   balance: string
   created_at: string
+  is_primary?: boolean
 }
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8001').replace(/\/$/, '')
@@ -100,12 +101,20 @@ export interface TransferInput {
   upi_id: string
   amount: string
   note: string
+  source_account_id?: number
+}
+
+export interface SelfTransferInput {
+  source_account_id: number
+  destination_account_id: number
+  amount: string
+  note: string
 }
 
 export interface PaymentReceipt {
   transaction_id: string
-  type: 'TRANSFER' | 'DEMO_FUNDING'
-  direction: 'INCOMING' | 'OUTGOING' | 'FUNDING'
+  type: 'TRANSFER' | 'DEMO_FUNDING' | 'SELF_TRANSFER'
+  direction: 'INCOMING' | 'OUTGOING' | 'FUNDING' | 'SELF'
   status: 'SUCCESS' | 'FAILED'
   amount: string
   currency: 'INR'
@@ -115,6 +124,10 @@ export interface PaymentReceipt {
   note: string
   failure_reason: string | null
   created_at: string
+  source_bank?: string | null
+  source_masked_account?: string | null
+  destination_bank?: string | null
+  destination_masked_account?: string | null
 }
 
 export interface PaymentHistory {
@@ -128,10 +141,18 @@ export function resolveRecipient(token: string, upi_id: string) {
   })
 }
 
-export function fundDemo(token: string, key: string) {
+export function fundDemo(token: string, key: string, accountId?: number) {
   return apiRequest<PaymentReceipt>('/demo/fund', {
-    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Idempotency-Key': key }, body: '{}',
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Idempotency-Key': key }, body: JSON.stringify(accountId ? { account_id: accountId } : {}),
   })
+}
+
+export function setPrimaryAccount(token: string, id: number) {
+  return apiRequest<BankAccount>(`/accounts/${id}/primary`, { method: 'PATCH', headers: { Authorization: `Bearer ${token}` } })
+}
+
+export function selfTransfer(token: string, key: string, payload: SelfTransferInput) {
+  return apiRequest<PaymentReceipt>('/payments/self-transfer', { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Idempotency-Key': key }, body: JSON.stringify(payload) })
 }
 
 export function transferMoney(token: string, key: string, payload: TransferInput) {

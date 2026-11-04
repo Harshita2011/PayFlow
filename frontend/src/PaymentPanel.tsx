@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
-import { ApiError, fundDemo, getPaymentHistory, getPaymentReceipt, resolveRecipient, transferMoney } from './api'
-import type { PaymentReceipt, Recipient, TransferInput } from './api'
+import { ApiError, fundDemo, getPaymentHistory, getPaymentReceipt, resolveRecipient, transferMoney, selfTransfer } from './api'
+import type { PaymentReceipt, Recipient, TransferInput, SelfTransferInput } from './api'
 import type { BankAccount } from './api'
 import MyQrCode from './MyQrCode'
 import QrScanner from './QrScanner'
@@ -12,10 +12,15 @@ import { canonicalAmount, minorUnits } from './moneyInput'
 import { payMoneyRequest } from './socialApi'
 import type { MoneyRequest } from './socialApi'
 import SocialPanel from './SocialPanel'
+import SelfTransferPanel from './SelfTransferPanel'
+import SplitPanel from './SplitPanel'
 
 interface Props {
   token: string
   accountId: number
+  sourceAccountId?: number
+  accounts?: BankAccount[]
+  onLockChanged?: (locked: boolean) => void
   senderAccount?: Pick<BankAccount, 'bank_name' | 'masked_account_number' | 'upi_id' | 'balance'>
   onLogout: (message?: string) => void
   onBalanceChanged: () => Promise<void>
@@ -23,7 +28,7 @@ interface Props {
   onNavigate?: (view: DashboardView) => void
 }
 
-type Intent = { key: string; kind: 'fund' | 'transfer' | 'request'; requestId?: string; payload?: TransferInput; uncertain: boolean }
+type Intent = { key: string; kind: 'fund' | 'transfer' | 'request' | 'self'; fundAccountId?: number; selfPayload?: SelfTransferInput; requestId?: string; payload?: TransferInput; uncertain: boolean }
 
 const pendingKey = (accountId: number) => `payflow.pending.${accountId}`
 
@@ -39,7 +44,11 @@ function restoredIntent(accountId: number): Intent | null {
   try {
     const value = JSON.parse(sessionStorage.getItem(pendingKey(accountId)) || 'null') as Intent | null
     if (!value || typeof value.key !== 'string' || !/^[0-9a-f-]{36}$/.test(value.key)) return null
-    if (value.kind === 'fund') return { key: value.key, kind: 'fund', uncertain: true }
+    if (value.kind === 'fund') return { key: value.key, kind: 'fund', fundAccountId: value.fundAccountId, uncertain: true }
+    if (value.kind === 'self' && value.selfPayload && Number.isInteger(value.selfPayload.source_account_id) && Number.isInteger(value.selfPayload.destination_account_id) && typeof value.selfPayload.note === 'string') {
+      canonicalAmount(value.selfPayload.amount)
+      return { key: value.key, kind: 'self', selfPayload: value.selfPayload, uncertain: true }
+    }
     if ((value.kind === 'transfer' || (value.kind === 'request' && typeof value.requestId === 'string' && /^[0-9a-f-]{36}$/.test(value.requestId))) && value.payload && typeof value.payload.upi_id === 'string' &&
         typeof value.payload.amount === 'string' && typeof value.payload.note === 'string') {
       canonicalAmount(value.payload.amount)
@@ -49,7 +58,7 @@ function restoredIntent(accountId: number): Intent | null {
   return null
 }
 
-export default function PaymentPanel({ token, accountId, senderAccount, onLogout, onBalanceChanged, view = 'all', onNavigate }: Props) {
+export default function PaymentPanel({ token, accountId, senderAccount, onLogout, onBalanceChanged, view = 'all', onNavigate, accounts = [], sourceAccountId, onLockChanged }: Props) {
   const [busy, setBusy] = useState(false)
   const [feedback, setFeedback] = useState('')
   const [feedbackTone, setFeedbackTone] = useState<'error' | 'success'>('error')
@@ -68,13 +77,17 @@ export default function PaymentPanel({ token, accountId, senderAccount, onLogout
   const mounted = useRef(true)
   const posting = useRef(false)
   const amountInput = useRef<HTMLInputElement>(null)
-  const insufficientMessage = senderAccount ? `Insufficient simulated funds. Available balance: ${formatMoney(senderAccount.balance)}.` : ''
-  const confirmationOverBalance = !!(senderAccount && draft?.amount && minorUnits(draft.amount) > minorUnits(senderAccount.balance))
+  const confirmationAccount = accounts.find((account) => account.id === draft?.source_account_id) || senderAccount
+  const insufficientMessage = confirmationAccount ? `Insufficient simulated funds. Available balance: ${formatMoney(confirmationAccount.balance)}.` : ''
+  const confirmationOverBalance = !!(confirmationAccount && draft?.amount && minorUnits(draft.amount) > minorUnits(confirmationAccount.balance))
 
-  function checkBalance(amount: string) {
+  function checkBalance(amount: string, sourceId?: number) {
     // Exact minor units, never floating-point money. The backend checks again under locks.
-    if (senderAccount && minorUnits(amount) > minorUnits(senderAccount.balance)) throw new Error(insufficientMessage)
+    const source = accounts.find((account) => account.id === sourceId) || senderAccount
+    if (source && minorUnits(amount) > minorUnits(source.balance)) throw new Error(`Insufficient simulated funds. Available balance: ${formatMoney(source.balance)}.`)
   }
+
+  useEffect(() => { onLockChanged?.(busy || intent !== null || recipient !== null) }, [busy, intent, recipient, onLockChanged])
 
   useEffect(() => {
     mounted.current = true
@@ -136,8 +149,9 @@ export default function PaymentPanel({ token, accountId, senderAccount, onLogout
         upi_id: String(fields.get('upi_id') || '').trim().toLowerCase(),
         amount: canonicalAmount(String(fields.get('amount') || '').trim()),
         note: String(fields.get('note') || '').trim(),
+        ...(sourceAccountId ? { source_account_id: sourceAccountId } : {}),
       }
-      checkBalance(payload.amount)
+      checkBalance(payload.amount, payload.source_account_id)
       setBusy(true)
       const found = await resolveRecipient(token, payload.upi_id)
       if (!mounted.current) return
@@ -170,7 +184,12 @@ export default function PaymentPanel({ token, accountId, senderAccount, onLogout
     // An uncertain retry must reach the backend with its original key even if
     // the first attempt already debited the now-lower displayed balance.
     if (next.kind !== 'fund' && !next.uncertain) {
-      try { checkBalance(next.payload!.amount) }
+      try {
+        if (next.kind === 'self') {
+          const source = accounts.find((account) => account.id === next.selfPayload!.source_account_id)
+          if (!source || minorUnits(next.selfPayload!.amount) > minorUnits(source.balance)) throw new Error('Insufficient simulated funds in the selected source account.')
+        } else checkBalance(next.payload!.amount, next.payload?.source_account_id)
+      }
       catch (error) { handleError(error); return }
     }
     posting.current = true
@@ -188,7 +207,7 @@ export default function PaymentPanel({ token, accountId, senderAccount, onLogout
     setIntent(next)
     let result: PaymentReceipt
     try {
-      result = next.kind === 'fund' ? await fundDemo(token, next.key) : next.kind === 'request' ? await payMoneyRequest(token, next.requestId!, next.key) : await transferMoney(token, next.key, next.payload!)
+      result = next.kind === 'fund' ? await fundDemo(token, next.key, next.fundAccountId) : next.kind === 'request' ? await payMoneyRequest(token, next.requestId!, next.key, next.payload?.source_account_id) : next.kind === 'self' ? await selfTransfer(token, next.key, next.selfPayload!) : await transferMoney(token, next.key, next.payload!)
     } catch (error) {
       if (mounted.current) {
         if (error instanceof ApiError && error.status >= 400 && error.status < 500 && error.status !== 408) {
@@ -218,7 +237,7 @@ export default function PaymentPanel({ token, accountId, senderAccount, onLogout
       setQrRecipient(null)
       setFormRevision((value) => value + 1)
       setFeedbackTone('success')
-      setFeedback(next.kind === 'fund' ? 'Simulated funds added successfully.' : 'Simulated payment completed.')
+      setFeedback(next.kind === 'fund' ? 'Simulated funds added successfully.' : next.kind === 'self' ? 'Simulated self-transfer completed.' : 'Simulated payment completed.')
       refreshHistory()
       try { await onBalanceChanged() }
       catch { if (mounted.current) { setFeedbackTone('error'); setFeedback('Payment succeeded. Balance refresh failed; use Refresh accounts to check it.') } }
@@ -258,22 +277,24 @@ export default function PaymentPanel({ token, accountId, senderAccount, onLogout
       <p className="account-note">PayFlow QR codes identify a recipient. You choose the amount and confirm every payment.</p>
     </div>}
     {(scannerOpen || view === 'scan') && senderAccount && !intent && <QrScanner ownUpiId={senderAccount.upi_id} onRecipient={selectQrRecipient} onClose={() => { setScannerOpen(false); if (view === 'scan') onNavigate?.('send') }} />}
-    {['all', 'home', 'account'].includes(view) && <div className="demo-funding"><div className="funding-symbol" aria-hidden="true">＋</div><p>Add fictional test funds.<span>₹1,000 per action · 3 actions per user.</span></p><button className="secondary-button" disabled={busy || intent !== null} onClick={() => pay({ key: crypto.randomUUID(), kind: 'fund', uncertain: false })}>Add ₹1,000 demo funds</button></div>}
+    {['all', 'home', 'account'].includes(view) && <div className="demo-funding"><div className="funding-symbol" aria-hidden="true">＋</div><p>Add fictional test funds.<span>₹1,000 per action · 3 actions per user.</span>{senderAccount && <span>Into {senderAccount.bank_name} · {senderAccount.masked_account_number}</span>}</p><button className="secondary-button" disabled={busy || intent !== null} onClick={() => pay({ key: crypto.randomUUID(), kind: 'fund', fundAccountId: sourceAccountId, uncertain: false })}>Add ₹1,000 demo funds</button></div>}
     {feedback && <p className={`feedback ${feedbackTone}`} role="status">{feedback}</p>}
-    {intent?.uncertain && <div className="uncertain-payment" role="alert"><strong>Keep this payment request.</strong><p>{intent.kind === 'fund' ? 'Demo funding · ₹1,000.00' : `${formatMoney(intent.payload!.amount)} to ${intent.payload?.upi_id}`}</p><button className="primary-button" disabled={busy} onClick={() => pay(intent)}>{busy ? 'Checking payment…' : 'Retry same request'}</button></div>}
+    {intent?.uncertain && <div className="uncertain-payment" role="alert"><strong>Keep this payment request.</strong><p>{intent.kind === 'fund' ? 'Demo funding · ₹1,000.00' : intent.kind === 'self' ? `${formatMoney(intent.selfPayload!.amount)} between your own accounts` : `${formatMoney(intent.payload!.amount)} to ${intent.payload?.upi_id}`}</p><button className="primary-button" disabled={busy} onClick={() => pay(intent)}>{busy ? 'Checking payment…' : 'Retry same request'}</button></div>}
     {view !== 'all' && senderAccount && <SocialPanel token={token} accountId={accountId} view={view} revision={reload} locked={busy || intent !== null} senderAccount={senderAccount} onNavigate={onNavigate} onLogout={onLogout} onSend={async (upi) => {
       if (busy || intent) return
       setBusy(true)
       try { await selectQrRecipient(upi, new AbortController().signal) }
       catch (error) { if (mounted.current) handleError(error) }
       finally { if (mounted.current) setBusy(false) }
-    }} onPay={(item: MoneyRequest) => pay({ key: crypto.randomUUID(), kind: 'request', requestId: item.id, payload: { upi_id: item.requester.upi_id, amount: item.amount, note: item.note }, uncertain: false })} onReceipt={async (id) => { await viewReceipt(id); onNavigate?.('transactions') }} />}
+    }} onPay={(item: MoneyRequest) => pay({ key: crypto.randomUUID(), kind: 'request', requestId: item.id, payload: { upi_id: item.requester.upi_id, amount: item.amount, note: item.note, ...(sourceAccountId ? { source_account_id: sourceAccountId } : {}) }, uncertain: false })} onReceipt={async (id) => { await viewReceipt(id); onNavigate?.('transactions') }} />}
+    {view === 'self' && <SelfTransferPanel accounts={accounts} locked={busy || intent !== null} onPay={(payload) => pay({ key: crypto.randomUUID(), kind: 'self', selfPayload: payload, uncertain: false })} />}
+    {(view === 'split-create' || view === 'splits') && senderAccount && <SplitPanel token={token} accountId={accountId} view={view} revision={reload} locked={busy || intent !== null} senderAccount={senderAccount} onNavigate={onNavigate} onLogout={onLogout} onPay={(item) => pay({ key: crypto.randomUUID(), kind: 'request', requestId: item.id, payload: { upi_id: item.requester.upi_id, amount: item.amount, note: item.note, ...(sourceAccountId ? { source_account_id: sourceAccountId } : {}) }, uncertain: false })} onReceipt={async (id) => { await viewReceipt(id); onNavigate?.('transactions') }} />}
     <div hidden={!['all', 'send'].includes(view)} className="transfer-surface surface">
     {view !== 'all' && <ol className="payment-steps" aria-label="Payment progress"><li aria-current={!qrRecipient && !recipient ? 'step' : undefined}>1 · Recipient</li><li aria-current={qrRecipient && !recipient ? 'step' : undefined}>2 · Amount</li><li aria-current={recipient ? 'step' : undefined}>3 · Confirm</li></ol>}
     {recipient && draft ? <div className="payment-confirm" aria-label="Confirm simulated payment">
       <h4>Confirm your simulated payment</h4><p className="confirm-amount">{formatMoney(draft.amount)}</p>
       <p><strong>{recipient.display_name}</strong><br />{recipient.upi_id}<br /><span>{recipient.bank_name}</span></p>
-      {senderAccount && <p className="sender-details">From {senderAccount.bank_name} · {senderAccount.masked_account_number}</p>}
+      {confirmationAccount && <p className="sender-details">From {confirmationAccount.bank_name} · {confirmationAccount.masked_account_number}</p>}
       {draft.note && <p>Note: {draft.note}</p>}
       {confirmationOverBalance && <p className="feedback error" role="alert">{insufficientMessage}</p>}
       <button className="primary-button" disabled={busy || intent !== null || confirmationOverBalance} onClick={() => pay({ key: crypto.randomUUID(), kind: 'transfer', payload: draft, uncertain: false })}>{busy ? 'Sending…' : `Confirm and send ${formatMoney(draft.amount)}`}</button>
@@ -287,10 +308,11 @@ export default function PaymentPanel({ token, accountId, senderAccount, onLogout
       </fieldset>
     </form>)}
     </div>
-    {receipt && <article hidden={!['all', 'home', 'send', 'transactions'].includes(view)} className={`payment-receipt ${receipt.status.toLowerCase()}`} aria-label="Payment receipt">
+    {receipt && <article hidden={!['all', 'home', 'send', 'transactions', 'self'].includes(view)} className={`payment-receipt ${receipt.status.toLowerCase()}`} aria-label="Payment receipt">
       <div className="account-heading"><h4>Payment receipt</h4><span className="demo-tag">{receipt.status}</span></div>
       <p className="receipt-amount">{formatMoney(receipt.amount)} <small>simulated INR</small></p>
-      <p>{receipt.direction} · {receipt.counterparty_name}<br />{receipt.counterparty_upi_id}</p>
+      <p>{receipt.direction === 'SELF' ? 'Self Transfer' : receipt.direction} · {receipt.counterparty_name}<br />{receipt.counterparty_upi_id}</p>
+      {receipt.type === 'SELF_TRANSFER' && <p>From {receipt.source_bank} · {receipt.source_masked_account}<br />To {receipt.destination_bank} · {receipt.destination_masked_account}<br />No change to your combined funds.</p>}
       <p className="receipt-id">Transaction ID<br />{receipt.transaction_id}</p>
       <p>{new Date(receipt.created_at).toLocaleString()}{receipt.note && <><br />{receipt.note}</>}</p>
       {receipt.failure_reason && <p>{receipt.failure_reason} · No funds moved.</p>}

@@ -15,7 +15,31 @@ def reconcile(connection):
         count(*) FILTER (WHERE e.amount=-p.amount AND e.ledger_account_id=CASE WHEN p.type='DEMO_FUNDING' THEN 'demo-funding' ELSE 'bank-' || p.sender_account_id END)<>1 OR
         count(*) FILTER (WHERE e.amount=p.amount AND e.ledger_account_id='bank-' || p.recipient_account_id)<>1))
         OR (p.status='FAILED' AND count(e.payment_id)<>0)""")).scalars().all()
-    return {"balanced": net == 0, "account_mismatches": mismatches, "invalid_postings": invalid}
+    self_invalid = connection.execute(text("""SELECT p.id FROM payments p
+        JOIN bank_accounts s ON s.id=p.sender_account_id JOIN bank_accounts t ON t.id=p.recipient_account_id
+        WHERE p.type='SELF_TRANSFER' AND p.status='SUCCESS' AND
+          (s.id=t.id OR s.user_id<>p.actor_user_id OR t.user_id<>p.actor_user_id OR
+           (SELECT coalesce(sum(e.amount),0) FROM ledger_entries e JOIN ledger_accounts l ON l.id=e.ledger_account_id
+            JOIN bank_accounts a ON a.id=l.bank_account_id WHERE e.payment_id=p.id AND a.user_id=p.actor_user_id)<>0)""")).scalars().all()
+    request_invalid = connection.execute(text("""SELECT r.id FROM money_requests r
+        LEFT JOIN money_request_destinations d ON d.request_id=r.id LEFT JOIN bank_accounts a ON a.id=d.account_id
+        LEFT JOIN payments p ON p.id=r.payment_id LEFT JOIN bank_accounts s ON s.id=p.sender_account_id
+        WHERE d.account_id IS NULL OR a.user_id<>r.requester_user_id OR (r.status='PAID' AND
+          (p.id IS NULL OR p.status<>'SUCCESS' OR p.type<>'TRANSFER' OR p.amount<>r.amount OR p.note<>r.note
+           OR p.recipient_account_id<>d.account_id OR s.user_id<>r.payer_user_id))""")).scalars().all()
+    split_invalid = connection.execute(text("""SELECT s.id FROM expense_splits s
+        LEFT JOIN expense_split_participants t ON t.split_id=s.id LEFT JOIN money_requests r ON r.id=t.current_request_id
+        GROUP BY s.id HAVING coalesce(sum(t.share_amount),0)<>s.total_amount OR
+          (s.status='SETTLED' AND count(*) FILTER(WHERE t.user_id<>s.creator_user_id AND r.status='PAID')
+             <>count(*) FILTER(WHERE t.user_id<>s.creator_user_id)) OR
+          (s.status='OPEN' AND count(*) FILTER(WHERE t.user_id<>s.creator_user_id AND r.status='PAID')
+             =count(*) FILTER(WHERE t.user_id<>s.creator_user_id)) OR
+          (s.status='CANCELLED' AND count(*) FILTER(WHERE r.status IN ('PENDING','PAID'))>0)""")).scalars().all()
+    primary_invalid = connection.execute(text("""SELECT user_id FROM bank_accounts GROUP BY user_id
+        HAVING count(*)>4 OR count(*) FILTER(WHERE is_primary)<>1""")).scalars().all()
+    return {"balanced": net == 0, "account_mismatches": mismatches, "invalid_postings": invalid,
+        "invalid_self_transfers": self_invalid, "invalid_request_links": request_invalid,
+        "invalid_splits": split_invalid, "invalid_primary_accounts": primary_invalid}
 
 
 if __name__ == "__main__":
@@ -24,4 +48,4 @@ if __name__ == "__main__":
         connection.execution_options(isolation_level="REPEATABLE READ")
         result = reconcile(connection)
     print(result)
-    raise SystemExit(0 if result["balanced"] and not result["account_mismatches"] and not result["invalid_postings"] else 1)
+    raise SystemExit(0 if result["balanced"] and not any(value for key, value in result.items() if key != "balanced") else 1)

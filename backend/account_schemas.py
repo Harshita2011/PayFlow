@@ -18,6 +18,7 @@ class AccountResponse(BaseModel):
     upi_id: str
     balance: Decimal = Field(ge=0, max_digits=18, decimal_places=2)
     created_at: datetime
+    is_primary: bool
 
     @field_serializer("balance")
     def serialize_balance(self, value: Decimal) -> str:

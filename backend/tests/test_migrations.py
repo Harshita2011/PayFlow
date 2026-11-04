@@ -33,10 +33,10 @@ class MigrationTests(unittest.TestCase):
         command.upgrade(self.config, "head")
         command.upgrade(self.config, "head")
         inspector = inspect(self.connection)
-        self.assertEqual(set(inspector.get_table_names()), {"users", "bank_accounts", "alembic_version", "ledger_accounts", "payments", "ledger_entries", "payment_requests", "recipient_lookup_limits", "contacts", "money_requests", "request_creation_limits"})
+        self.assertEqual(set(inspector.get_table_names()), {"users", "bank_accounts", "alembic_version", "ledger_accounts", "payments", "ledger_entries", "payment_requests", "recipient_lookup_limits", "contacts", "money_requests", "request_creation_limits", "money_request_destinations", "expense_splits", "expense_split_participants", "split_request_links"})
         balance = next(c for c in inspector.get_columns("bank_accounts") if c["name"] == "balance")
         self.assertEqual((balance["type"].precision, balance["type"].scale), (18, 2))
-        self.assertEqual(self.connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one(), "0004_contacts_money_requests")
+        self.assertEqual(self.connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one(), "0006_multiple_accounts")
         command.check(self.config)
 
     def test_existing_users_are_adopted_without_changes(self):
@@ -62,3 +62,26 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(self.connection.execute(text("SELECT count(*) FROM ledger_entries")).scalar_one(), 2)
         self.assertEqual(self.connection.execute(text("SELECT sum(amount) FROM ledger_entries")).scalar_one(), 0)
         self.assertEqual(self.connection.execute(text("SELECT note FROM payments")).scalar_one(), "Phase 3 opening balance")
+
+    def test_phase7_financial_rows_and_paid_request_are_preserved(self):
+        command.upgrade(self.config, "0004_contacts_money_requests")
+        for index in [1, 2]:
+            self.connection.execute(text("INSERT INTO users(id,full_name,email,password_hash,created_at) VALUES (:id,'Legacy Learner',:email,'unchanged-hash',CURRENT_TIMESTAMP)"), {"id": index, "email": f"legacy{index}@example.com"})
+            self.connection.execute(text("INSERT INTO bank_accounts(id,user_id,bank_name,account_number,upi_id,balance) VALUES (:id,:id,'Grove Demo Bank',:number,:upi,0)"), {"id": index, "number": "SIM"+str(index).zfill(16), "upi": f"legacy{index}@payflow"})
+        self.connection.execute(text("""INSERT INTO payments(id,actor_user_id,sender_account_id,recipient_account_id,amount,currency,type,status,sender_name,recipient_name,note)
+            VALUES ('legacy-fund',2,NULL,2,100,'INR','DEMO_FUNDING','SUCCESS','System','Legacy Learner','Demo'),
+            ('legacy-transfer',2,2,1,12.34,'INR','TRANSFER','SUCCESS','Legacy Learner','Legacy Learner','Lunch')"""))
+        self.connection.execute(text("""INSERT INTO ledger_entries(payment_id,ledger_account_id,amount) VALUES
+            ('legacy-fund','demo-funding',-100),('legacy-fund','bank-2',100),
+            ('legacy-transfer','bank-2',-12.34),('legacy-transfer','bank-1',12.34)"""))
+        self.connection.execute(text("UPDATE bank_accounts SET balance=CASE WHEN id=1 THEN 12.34 ELSE 87.66 END"))
+        self.connection.execute(text("""INSERT INTO money_requests(id,requester_user_id,payer_user_id,amount,note,status,payment_id,creation_key,fingerprint,expires_at)
+            VALUES ('legacy-request',1,2,12.34,'Lunch','PAID','legacy-transfer','legacy-key',repeat('a',64),CURRENT_TIMESTAMP+interval '7 days')"""))
+        names = ["users", "bank_accounts", "payments", "ledger_entries", "money_requests"]
+        def snapshot():
+            return {name: sorted(self.connection.execute(text(f"SELECT (to_jsonb(t)-'is_primary')::text FROM {name} t")).scalars()) for name in names}
+        before = snapshot()
+        command.upgrade(self.config, "head")
+        self.assertEqual(snapshot(), before)
+        self.assertEqual(self.connection.execute(text("SELECT account_id FROM money_request_destinations WHERE request_id='legacy-request'")).scalar_one(), 1)
+        self.assertEqual(self.connection.execute(text("SELECT count(*) FROM bank_accounts WHERE is_primary")).scalar_one(), 2)

@@ -58,7 +58,7 @@ class PaymentDatabaseTestCase(unittest.TestCase):
                 db.add(user)
                 db.flush()
                 account = BankAccount(user_id=user.id, bank_name=DemoBank.GROVE.value,
-                    account_number="SIM" + str(index + 1).zfill(16), upi_id=f"learner-{index}@payflow")
+                    account_number="SIM" + str(index + 1).zfill(16), upi_id=f"learner-{index}@payflow", is_primary=True)
                 db.add(account)
                 db.flush()
                 self.accounts.append({"id": account.id, "upi_id": account.upi_id, "user_id": user.id})
@@ -83,7 +83,13 @@ class PaymentDatabaseTestCase(unittest.TestCase):
             return list(connection.execute(text("SELECT balance FROM bank_accounts ORDER BY id")).scalars())
 
     def assert_reconciled(self):
+        from reconcile import reconcile
         with self.engine.connect() as connection:
+            audit = reconcile(connection)
+            self.assertTrue(audit["balanced"])
+            for key, value in audit.items():
+                if key != "balanced":
+                    self.assertEqual(value, [], key)
             self.assertEqual(connection.execute(text("SELECT coalesce(sum(amount),0) FROM ledger_entries")).scalar_one(), 0)
             self.assertEqual(connection.execute(text("""SELECT count(*) FROM bank_accounts a WHERE balance <>
                 (SELECT coalesce(sum(e.amount),0) FROM ledger_entries e JOIN ledger_accounts l ON l.id=e.ledger_account_id WHERE l.bank_account_id=a.id)""")).scalar_one(), 0)

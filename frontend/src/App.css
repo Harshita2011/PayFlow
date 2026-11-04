@@ -354,3 +354,32 @@ button:focus-visible, a:focus-visible { outline: 3px solid var(--primary); outli
 .quick-actions { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 @media (max-width: 1200px) { .quick-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 720px) { .social-panel .account-heading { align-items: flex-start; } .request-card { padding: 15px; } .social-shortcuts > button { flex: 1 1 130px; } .dialog-actions { flex-direction: column; } .sidebar nav { overflow-y: visible; } .contact-avatar { width: 40px; height: 40px; } }
+.account-cards { display: grid; gap: 20px; }
+.source-account-picker { margin: 0 0 24px; max-width: 760px; }
+.add-account, .self-transfer { margin: 20px 0; }
+.wallet-total { font-size: 14px; color: var(--muted); margin: 18px 0 24px; }
+.wallet-total strong { color: var(--ink); font-size: 20px; }
+.secondary-actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 0 0 24px; }
+.secondary-actions .secondary-button { width: auto; margin: 0; min-height: 44px; font-size: 12px; padding: 10px 14px; }
+.checkbox-label { display: flex; align-items: flex-start; gap: 10px; line-height: 1.7; font-weight: 400; }
+.checkbox-label input { width: 19px; height: 19px; min-height: 19px; margin: 3px 0 0; flex-shrink: 0; accent-color: var(--primary); }
+.share-preview { border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin: 20px 0; }
+.share-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0; border-top: 1px solid var(--line); font-size: 13px; }
+.share-row > span { min-width: 0; flex: 1; overflow-wrap: anywhere; }
+.share-row small { display: block; color: var(--muted); margin-top: 4px; }
+.share-row > label { max-width: 150px; margin-bottom: 0; }
+.share-row .text-button { font-size: 12px; }
+.split-panel > .surface, .split-detail { margin-bottom: 24px; }
+.split-panel { overflow-wrap: anywhere; }
+.split-list button > span { min-width: 0; overflow-wrap: anywhere; }
+.split-list { list-style: none; margin: 0; padding: 0; }
+.split-list li { border-top: 1px solid var(--line); }
+.split-list button { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 18px 0; text-align: left; border: 0; background: none; color: var(--ink); }
+.split-list small { display: block; color: var(--muted); font-size: 12px; margin-top: 5px; }
+.split-totals { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 14px; }
+.split-totals > div { padding: 14px; border: 1px solid var(--line); border-radius: 10px; }
+.split-totals dt { font-size: 12px; color: var(--muted); }
+.split-totals dd { font-size: 22px; font-weight: 650; margin: 7px 0 0; overflow-wrap: anywhere; }
+.split-detail details { font-size: 12px; color: var(--muted); }
+.split-detail summary { cursor: pointer; min-height: 44px; }
+@media (max-width: 720px) { .secondary-actions > button { flex: 1 1 140px; } .share-row { flex-wrap: wrap; } .share-row > span { flex-basis: 100%; } .share-row > label { max-width: none; flex: 1; } .split-list button { flex-direction: column; align-items: flex-start; gap: 8px; } .split-totals { grid-template-columns: 1fr 1fr; } .split-totals > div { padding: 10px; } .split-totals dd { font-size: 18px; } }
