@@ -1,12 +1,17 @@
-# PayFlow — Phase 4 simulated payment engine
+# PayFlow — Phase 7 contacts and request money
 
 PayFlow is a local UPI payment **simulation** for learning. Phase 2 provides
 registration → login → JWT access token → protected profile → client-side logout.
 Phase 3 adds one fictional bank account and an automatically generated @payflow
 identity per authenticated user, starting at **₹0.00 simulated funds**.
 Phase 4 adds controlled demo funding, confirmed simulated transfers, a balanced
-ledger, idempotent retries, receipts, and history. There are no real bank
-connections, actual UPI networks, real money, or QR payment features.
+ledger, idempotent retries, receipts, and history. Phase 5 adds public PayFlow QR
+codes, camera/image scanning, and verified recipient selection through the same
+explicitly confirmed payment flow. There are no real bank connections, actual
+UPI networks, NPCI requests, or real money. Phase 6 refines the frontend with a
+blue design system, responsive navigation, and focused screens using these same APIs.
+Phase 7 adds personal saved contacts, favorites, derived recent contacts, and
+explicitly confirmed money requests using the existing atomic payment engine.
 
 ## Run locally (PowerShell)
 
@@ -55,7 +60,653 @@ configuration: never put a signing key or database credentials there.
 Use Ctrl+C in each terminal to stop its server. If an older server is already
 running, stop that server and restart it to load the new dependencies/settings.
 
-## Files and important code
+## Phase 7 — Contacts, recent people and request money
+
+Three concepts stay separate:
+
+- A **saved contact** is an entry in your personal address book. It does not mean
+  the other person accepted a friendship and does not disclose your address book.
+- A **money request** asks a specific PayFlow user for fictional INR. Creating,
+  declining, cancelling or expiring it moves no money.
+- A **completed payment** is an immutable successful transfer with a balanced
+  debit/credit ledger posting. Only this can settle a money request.
+
+### Database and migration
+
+The additive revision is **`0004_contacts_money_requests`**, following
+`0003_payment_engine`. The existing `payment_requests` table already stores the
+Phase 4 idempotency reservations. It is preserved unchanged. User-facing collect
+requests therefore use **`money_requests`**, not a replacement table.
+
+| Table | Purpose and constraints |
+| --- | --- |
+| `contacts` | UUID contact ID, owner/contact user foreign keys, favorite flag, timestamps. Unique owner/contact pair; CHECK prevents self-contact; owner index. |
+| `money_requests` | UUID request ID, requester/payer foreign keys, NUMERIC(18,2) amount, immutable note and terms, state, unique nullable successful payment link, expiry and timestamps, creation key/fingerprint. No self-request; amount >0 and ≤₹100,000; status/link/expiry checks; incoming/outgoing indexes. |
+| `request_creation_limits` | Per-user hourly request-creation counter, enforced in PostgreSQL across workers. |
+
+Database triggers prevent changing request participants, amount, note, creation
+identity or expiry, prevent deleting request history, and make terminal requests
+immutable. A deferred trigger requires a PAID request to reference its exact
+successful INR transfer: correct payer, requester, amount, note, and timing.
+The payment must have been created during that request's lifetime. Existing
+payment immutability, double-entry and balance-reconciliation triggers still run.
+
+Migration verification was performed against fresh isolated schemas first, then
+applied to the local database. Hash comparisons of every pre-existing user,
+account, payment, ledger, idempotency and lookup record confirmed them unchanged.
+The new development tables started empty; no persistent test payments were added.
+
+```powershell
+cd D:\PayFLow\backend
+.\.venv\Scripts\python.exe -m alembic current
+.\.venv\Scripts\python.exe -m alembic upgrade head
+.\.venv\Scripts\python.exe -m alembic check
+.\.venv\Scripts\python.exe -B reconcile.py
+```
+
+The migration contains only new tables, indexes, functions and triggers. Its
+downgrade refuses destructive removal. Normal application startup never migrates
+or creates tables.
+
+### Protected APIs
+
+Every endpoint below requires the existing `Authorization: Bearer <token>`.
+Exact UPI lookup reuses `POST /payments/resolve`; there is no public user listing.
+
+| Method / path | Behavior |
+| --- | --- |
+| `POST /contacts` | Add by verified `upi_id`; 201 new, 200 existing duplicate. |
+| `GET /contacts` | Own address book, favorites first, up to the 200-contact cap. |
+| `DELETE /contacts/{id}` | Remove only the authenticated owner's contact; 204. Accounts and history are untouched. |
+| `PATCH /contacts/{id}/favorite` | Strict boolean `is_favorite`, owner-scoped. |
+| `GET /contacts/recent?limit=10` | Up to 20 deduplicated counterparties from own successful incoming/outgoing transfers, newest interaction first. |
+| `POST /payment-requests` | Create using `upi_id`, exact decimal-string `amount`, optional `note`; requires UUID `Idempotency-Key`. 201 new, 200 replay of the existing request's current state. |
+| `GET /payment-requests/incoming` | Payer's requests, exact pending count and keyset pagination. |
+| `GET /payment-requests/outgoing` | Requester's requests, exact pending count and keyset pagination. |
+| `GET /payment-requests/{id}` | Participant-only detail; unrelated users get 404. |
+| `POST /payment-requests/{id}/decline` | `{}`; only designated payer, pending requests only. |
+| `POST /payment-requests/{id}/cancel` | `{}`; only requester, pending requests only. |
+| `POST /payment-requests/{id}/pay` | `{}` and UUID `Idempotency-Key`; only designated payer. Existing safe payment receipt returned. No client amount, sender, owner or balance accepted. |
+
+Lists accept `limit` 1–50 (default 20) and `before=<request UUID>`. Ordering is
+stable descending `(created_at,id)`. Responses use only public display name/UPI
+for counterparties, plus the contact/request identifiers necessary for actions;
+no other user's email, account number, balance or private user ID is exposed.
+The existing receipt API remains participant-scoped.
+
+Example bodies in FastAPI `/docs` (use a new UUID key for each intended action):
+
+```json
+{ "upi_id": "another-learner@payflow" }
+```
+
+```json
+{ "is_favorite": true }
+```
+
+```json
+{ "upi_id": "another-learner@payflow", "amount": "500.00", "note": "Shared fictional lunch" }
+```
+
+The last body creates a request; it is **not** a transfer. Response shape:
+
+```json
+{
+  "id": "<request UUID>",
+  "requester": { "display_name": "Asha", "upi_id": "asha@payflow" },
+  "payer": { "display_name": "Ravi", "upi_id": "ravi@payflow" },
+  "amount": "500.00",
+  "note": "Shared fictional lunch",
+  "status": "PENDING",
+  "payment_id": null,
+  "created_at": "<UTC timestamp>",
+  "updated_at": "<UTC timestamp>",
+  "expires_at": "<UTC timestamp, seven days later>"
+}
+```
+
+### Lifecycle, privacy and abuse limits
+
+Requests expire after seven days. `PENDING` can become `PAID`, `DECLINED`,
+`CANCELLED` or `EXPIRED`; terminal states never reopen. Reads derive EXPIRED
+using the database clock even if the stored row still says PENDING. A subsequent
+action persists expiry while holding the row lock. There is no scheduler or
+background deletion. The frontend also checks expiry periodically; the server
+remains authoritative. Successful payment is the only path to PAID.
+
+Lookup allows ten attempts per user per minute, including misses and self-lookups,
+using the existing shared PostgreSQL limiter. Saving/creating revalidates the UPI
+ID through that same protection. Creation allows ten requests per hour, at most
+20 active outgoing requests per requester and 50 active incoming requests per
+payer. Sorted transaction-scoped advisory locks serialize the cap checks; no
+existing user record is modified. Contacts have a 200-entry personal cap.
+
+All amount rules reuse the transfer schema: decimal strings, positive amounts,
+at most two decimal places, maximum ₹100,000, note length ≤140. Extra owner,
+amount override or reassignment fields are rejected. CORS now permits the required
+PATCH/DELETE methods only for the same configured local frontend origins. Social
+and request responses also use `Cache-Control: no-store`.
+
+### Atomic request payment and retry policy
+
+There is one payment engine. `execute_payment` now accepts an optional internal
+money-request identifier; normal transfers, QR transfers and funding retain their
+existing behavior. Request payment derives immutable terms from PostgreSQL and
+uses this transaction order:
+
+1. Reserve/lock the existing user-scoped payment idempotency key. The fingerprint
+   includes the collect-request ID as well as the normalized transfer terms.
+2. Lock that money-request row with `SELECT FOR UPDATE`; check designated payer,
+   state and database-clock expiry. Cancel/decline take only this request lock.
+3. Lock sender/recipient accounts in ascending account-ID order, shared with all
+   other payments. Recheck expiry after waiting, and check funds under the locks.
+4. Use the original transfer code to update cached balances, insert one payment
+   and the matching debit/credit ledger entries. Set PAID and its payment link in
+   that same transaction, only when the payment succeeds.
+5. Check deferred ledger/cache/request invariants and commit everything together.
+   No committed transfer is followed by an unrelated status update.
+
+Concurrent same-key retries wait on the database uniqueness reservation. Different
+keys for the same already-paid request return its original successful receipt;
+the request row lock prevents a second posting. Same key/different request or a
+normal-transfer key reused for a collect payment returns 409. Cancel/pay and
+decline/pay races serialize on the request row: one valid state transition wins.
+Expiry is checked again after account-lock waits, with a DB trigger as a final
+guard. Normal transfers and collect payments share the same overspending locks.
+
+Insufficient funds records the existing engine's FAILED payment result and leaves
+the collect request pending. Retrying that *same* key returns the same final
+failure; after adding fictional funds, explicitly review and confirm a new attempt
+with a new key. Unexpected exceptions, deadlocks or uncertain outcomes return a
+safe 503 and roll back uncommitted work: keep the original key and retry.
+
+The frontend saves request-payment intent in the existing account-scoped session
+metadata before sending, including the request ID. Refresh/relogin in the same
+tab can restore that exact intent; no JWT is stored. Creating a collect request
+has its own saved creation key and database uniqueness/fingerprint constraint,
+so a lost creation response cannot silently duplicate requests. User data in
+browser storage is never trusted as authorization or as financial terms.
+
+### Frontend integration and activity
+
+Home includes recent contact avatars, Request Money and Contacts quick actions,
+and the pending incoming count. Desktop navigation adds Contacts, Request Money
+and Requests. Mobile keeps its five compact bottom actions: new features are
+reachable from Home or Profile → Saved Contacts / Money Requests / Request Money.
+
+Contacts has exact lookup, verified public identity, favorites, contact detail,
+send/request actions and a removal confirmation. Sending to a contact reuses the
+existing verified transfer flow. Requests has incoming/outgoing tabs, dates,
+expiry, status, pagination, decline/cancel dialogs and linked receipts. Pay fetches
+current request details and opens a keyboard-contained native confirmation with
+verified requester, exact amount/note and masked sender account. Only the explicit
+confirmation calls the request-pay API. Balance/history/request data refresh after
+success. A failed pay leaves the request available; unknown outcomes keep the
+original retry key and block another payment. Existing red warnings are preserved.
+
+The lightweight **Request activity** disclosure derives events from loaded own
+request states. It requires no notification table, push, email, SMS or WebSockets.
+Requests refresh on navigation, own actions, normal payments, or the explicit
+Refresh contacts & requests button. Another user's actions are visible after
+refresh; there is no live notification service.
+
+### Phase 7 file map
+
+| File | Added/changed responsibility |
+| --- | --- |
+| `backend/social_models.py` | Contacts, MoneyRequest and creation-limiter SQLAlchemy metadata. |
+| `backend/social_schemas.py` | Strict inputs and minimal public responses with exact decimal strings. |
+| `backend/social.py` | Authorized contacts, grouped recents, request creation/lists/detail/actions. Never writes balances. |
+| `backend/migrations/versions/0004_contacts_money_requests.py` | Three additive tables, constraints/indexes, immutable terms and exact successful payment-link checks. |
+| `backend/payments.py` | Existing engine accepts internal collect context; request lock/lifecycle, contextual key fingerprint and atomic PAID link. Original posting code remains shared. |
+| `backend/main.py` | Includes router, required CORS methods and no-store paths. |
+| `backend/migrations/env.py` | Registers new metadata for Alembic consistency checks. |
+| `backend/tests/test_social.py` | 24 isolated PostgreSQL tests for privacy, lifecycle, limits, immutable terms, ledger, rollback, idempotency and races. |
+| `backend/tests/test_migrations.py` | New head and table assertions; keeps baseline/legacy data-preservation checks. |
+| `frontend/src/socialApi.ts` | Typed contact and collect-request API helpers. |
+| `frontend/src/SocialPanel.tsx` | Contacts, recents, request composition/inbox/activity, scoped creation retries and confirmations. |
+| `frontend/src/ConfirmDialog.tsx` | Native modal with focus restoration, Escape and explicit keyboard containment. |
+| `frontend/src/moneyInput.ts` | Existing exact input validation extracted for reuse by transfer and collect forms. |
+| `frontend/src/PaymentPanel.tsx` | Existing posting/retry path handles request payments, restores request intents and refreshes social data. |
+| `frontend/src/api.ts` | Correctly handles the contact API's successful 204 empty response. |
+| `frontend/src/navigation.ts`, `frontend/src/DashboardShell.tsx`, `frontend/src/App.css` | New destinations, compact mobile access, social cards/dialog styling. |
+| `frontend/src/SocialPanel.test.tsx` | Contact/requests UI, confirmation/focus, empty/errors, create/pay recovery, insufficient funds and refresh tests. |
+| `frontend/src/App.test.tsx`, `frontend/src/Experience.test.tsx` | Existing focused fixtures supply empty social API responses; auth and navigation assertions preserved. |
+| `frontend/qa/phase7-browser.mjs` | Two-user Chromium contacts/request lifecycle and committed-response-loss test. |
+| `frontend/qa/phase6-browser.mjs`, `frontend/qa/isolated_backend.py` | Existing QR/direct browser checks extended safety guard and development social-table hash checks. |
+| `README.md` | Lifecycle, concurrency, schema, endpoints and test instructions. |
+
+### Phase 7 verification and exact commands
+
+Executed: **82 PostgreSQL backend tests passed** (58 regression +24 new),
+**127 React tests passed** (112 previous +15 social tests), TypeScript/production
+build and ESLint passed. Alembic check reports no pending schema differences.
+Before/after backend test hashes and migration hashes confirmed existing records
+unchanged. Development reconciliation reports balanced, no account mismatches and
+no invalid postings.
+
+Real Chromium checks used fresh `payflow_phase4_tests` schemas: two users registered,
+created accounts, saved/favorited/viewed/removed a contact, created a ₹500 request
+without moving funds, and explicitly paid it after funding the payer ₹1,000. A
+lost response after commit was recovered using the same key: exactly one transfer,
+request PAID, requester ₹500, payer ₹500, matching receipt accessible to both.
+Decline, cancel, recent contacts, pending count, keyboard modal containment,
+logout, and layouts at 320/390/768/1024/1440px passed. The previous direct/real-PNG
+QR transfer browser harness also passed. No development test payments were made.
+
+Normal local run, separate terminals:
+
+```powershell
+cd D:\PayFLow\backend
+docker start payflow-postgres-5436
+.\.venv\Scripts\python.exe -m alembic upgrade head
+.\.venv\Scripts\python.exe -m uvicorn main:app --reload --port 8001
+```
+
+```powershell
+cd D:\PayFLow\frontend
+npm install
+npm run dev -- --port 5173 --strictPort
+```
+
+Tests:
+
+```powershell
+cd D:\PayFLow\backend
+$env:REGISTER_TEST_POSTGRES = '1'
+.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v
+Remove-Item Env:REGISTER_TEST_POSTGRES
+.\.venv\Scripts\python.exe -m alembic check
+.\.venv\Scripts\python.exe -B reconcile.py
+```
+
+```powershell
+cd D:\PayFLow\frontend
+npm test
+npm run build
+npm run lint
+```
+
+For safe manual/browser testing, use the **isolated QA server and Vite commands in
+the Phase 6 section below**. They run the latest migration in a fresh test schema.
+With those servers running and `PLAYWRIGHT_MODULE` pointing to installed test
+tooling, run:
+
+```powershell
+cd D:\PayFLow\frontend
+node qa/phase7-browser.mjs
+node qa/phase6-browser.mjs
+```
+
+Manual two-user check on those isolated servers:
+
+1. Create A and B in separate browser profiles and create their demo accounts.
+2. B adds ₹1,000 demo funds. A uses Contacts to verify B's exact UPI ID, saves B,
+   favorites B and opens B's contact profile.
+3. A chooses Request Money, enters `500.00` and a note, reviews and sends. Verify
+   A still has ₹0 and B still has ₹1,000; the request is PENDING.
+4. B refreshes contacts/requests on Home, opens the pending incoming request,
+   chooses Pay, checks A's UPI ID and amount and explicitly confirms.
+5. Verify B has ₹500, A has ₹500 after account refresh, request is PAID, and both
+   participants can open its same transaction receipt. Reconciliation passes.
+6. Create another request and decline it as B; create another and cancel it as A.
+   Neither action changes balances. Remove A's contact entry: accounts, requests
+   and payment history remain intact.
+
+Stop the QA backend with Ctrl+C for its final ledger/hash checks, then stop test
+Vite. Test schemas are retained; no DROP/TRUNCATE cleanup is performed. Close the
+test Vite terminal or clear `VITE_API_BASE_URL` before using the normal API again.
+
+Known limitations: request activity is derived from loaded pages and is refreshed,
+not pushed live. Expiration is lazy and server-authoritative, without a scheduler.
+Saved contacts are not mutual friends. Abuse limits are deliberately small demo
+controls; a production service would need broader abuse monitoring and operational
+controls. Physical camera and screen-reader hardware were not tested in this
+phase; existing camera tests, synthetic-media checks and real image decoding
+regressions remain covered. No Phase 8 features or real payment integration exist.
+
+## Phase 6 — Frontend experience and UI/UX (previous phase)
+
+This phase changes the React experience only. Authentication, API contracts,
+PostgreSQL models, migrations, financial transactions, ledger constraints, and
+QR payload validation remain unchanged. No runtime dependency was added for Phase 6.
+
+### Screens and component structure
+
+`App` keeps the existing in-memory authentication hook. Once signed in,
+`DashboardShell` provides the sidebar, page title, quick actions, and navigation.
+`AccountPanel` remains mounted for that session and owns the current account.
+Its `PaymentPanel` also stays mounted when moving between screens. HTML `hidden`
+removes inactive content from keyboard navigation and the accessibility tree
+without destroying a reviewed payment, draft amount, or uncertain retry key.
+Logout unmounts the entire authenticated tree and releases the QR scanner.
+
+| Screen | Behavior |
+| --- | --- |
+| Home | Personalized welcome, simulated balance, bank summary, copy UPI ID, four quick actions, fixed demo funding, three recent transactions. |
+| Send Money | Verify recipient through the backend, enter amount/note, review sender and recipient, explicitly confirm, view receipt. |
+| Scan QR | Existing native modal with explicit camera start, permission feedback, upload fallback, and cleanup. Scanning selects a verified recipient; it never sends money. |
+| My QR | QR automatically displayed on this screen, readable public UPI ID, copy and PNG download. |
+| Transactions | Full loaded history, incoming/outgoing/funding filter, pagination, receipt access, loading and empty states. |
+| Bank Account | Masked demo account details, exact balance, UPI ID, refresh and fixed fictional funding. |
+| Profile | Existing name, email, member details, profile refresh, session explanation and linked account. Logout stays available in the shell. |
+
+Desktop uses all seven destinations in a sidebar. Mobile uses five bottom actions:
+Home, Send Money, Scan QR, Transactions, Profile. **My QR** is available from the
+Home quick actions; **Manage account** on Home or Profile opens Bank Account.
+The avatar opens Profile. Active navigation uses `aria-current="page"`.
+Navigation is local React state, so refreshing still signs out intentionally;
+it does not create public routes or persist JWTs.
+
+History filtering is client-side and clearly applies only to loaded pages.
+Load older payments to include earlier records. The backend pagination is unchanged.
+
+### Design system and accessibility
+
+`index.css` defines semantic CSS variables for blue accents, white surfaces,
+neutral backgrounds, text, borders, success and danger colors, spacing, radii,
+and shadows. `App.css` applies the shared controls/cards and responsive layouts.
+Breakpoints are 720px (bottom navigation), 1000px (compact workspace), and 1200px
+(two-column quick actions). Mobile inputs use readable text and controls of at
+least 44px. Currency grouping uses `BigInt` and Indian grouping rather than
+binary floating-point conversion: `1250.50` is displayed as **₹1,250.50** while
+the exact decimal API payload stays unchanged.
+
+Warnings and errors use red text with pale red backgrounds; successful actions
+use green. Text labels and live regions communicate status as well as color.
+Forms retain semantic labels, password fields have explicit Show/Hide actions,
+focus outlines are visible, the workspace has a skip link, and navigation focuses
+the page heading. Recipient verification focuses the amount field. Native QR
+dialogs retain Escape, focus containment/restoration, and camera cleanup. Reduced
+motion disables animations and transitions. No unsupported settings were added.
+
+Insufficient balances are blocked before review, with a second check before a new
+send. PostgreSQL remains the authority under locks. An uncertain request keeps its
+original idempotency key and can be retried even if its first attempt reduced the
+balance. Switching screens cannot generate a replacement key or start a new scan
+while that payment is unresolved.
+
+### Phase 6 files
+
+| File | Purpose |
+| --- | --- |
+| `frontend/src/navigation.ts` | Typed destinations and screen descriptions. |
+| `frontend/src/Icon.tsx` | Small shared SVG icon set; decorative icons are hidden from screen readers. |
+| `frontend/src/DashboardShell.tsx` | Desktop/mobile navigation, welcome header, quick actions, focus management and logout. |
+| `frontend/src/PasswordField.tsx` | Accessible visibility toggle without storing passwords. |
+| `frontend/src/CopyUpi.tsx` | Reusable clipboard action with success and failure feedback. |
+| `frontend/src/formatMoney.ts` | Exact Indian currency display with BigInt. |
+| `frontend/src/PaymentHistory.tsx` | Recent activity/full list, direction/status styling, loaded-page filter and receipt actions. |
+| `frontend/src/App.tsx` | Uses the new shell after login and reusable password fields; preserves registration/login/profile logic. |
+| `frontend/src/AccountPanel.tsx` | Current account shared across screens, copy/manage actions and precise balance formatting. |
+| `frontend/src/PaymentPanel.tsx` | View visibility, direct recipient-first entry, step indicators and shared history; existing posting/retry engine preserved. |
+| `frontend/src/MyQrCode.tsx` | Supports opening its QR immediately on the dedicated My QR screen. |
+| `frontend/src/index.css`, `frontend/src/App.css` | Tokens, blue visual design, responsive shell, focus, contrast, controls and reduced motion. |
+| `frontend/src/Experience.test.tsx` | Navigation, verified recipient steps, confirmation, navigation-safe uncertain retry, filtering, copy, exact currency and keyboard focus tests. |
+| `frontend/src/App.test.tsx`, `frontend/src/AccountPanel.test.tsx`, `frontend/src/PaymentPanel.test.tsx` | Existing regressions updated for intentional navigation and grouped currency display. |
+| `frontend/qa/isolated_backend.py` | Optional browser-test server using existing test fixtures in a fresh dedicated test schema. Hash-compares development records and reconciles the ledger on graceful exit; never deletes schemas. |
+| `frontend/qa/phase6-browser.mjs` | Reproducible Chromium two-user checks and screenshots, with a guard blocking writes to any API except isolated port 18016. |
+| `README.md` | Phase 6 design, file map, navigation, commands, verification and limitations. |
+
+### Run and test Phase 6
+
+Use the normal local commands above. No Phase 6 migration is needed. From
+`D:\PayFLow\frontend` run:
+
+```powershell
+npm test
+npm run build    # includes TypeScript checking
+npm run lint
+```
+
+Backend regressions use the isolated/rollback-safe fixtures described below:
+
+```powershell
+cd D:\PayFLow\backend
+$env:REGISTER_TEST_POSTGRES = '1'
+.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v
+Remove-Item Env:REGISTER_TEST_POSTGRES
+```
+
+Phase 6 verification: **112 React tests passed**, **58 PostgreSQL backend tests
+passed**, TypeScript/production build and ESLint passed. Alembic consistency was
+included in the backend regression suite. A full-row hash comparison before and
+after the backend suite confirmed development records unchanged, without printing
+credentials or private data.
+
+Real Chromium checks used a fresh schema in `payflow_phase4_tests`, not the
+development database. Two users registered/logged in, created accounts, funded
+₹1,000, transferred ₹12.30 directly, then transferred ₹125.50 using a real downloaded
+PNG and local ZXing decoding. The second transfer's committed response was
+deliberately lost: retrying used the same key, produced one posting, and left
+the sender at **₹862.20** and recipient at **₹137.80**. Both histories and receipts,
+copy/download, red insufficient-funds feedback, keyboard modal containment,
+synthetic camera cleanup, permission denial, reduced motion, logout, and widths
+320/390/768/1024/1440px were checked. No browser JavaScript errors were observed.
+
+Optional reproducible browser QA uses Playwright as a separate test tool, not an
+application dependency. Install Playwright/Chromium into a temporary tooling
+directory, or use your existing installation. Stop the normal frontend first so
+the test frontend can occupy port 5173. In separate terminals:
+
+```powershell
+# Terminal 1, repository root. Uses existing backend venv and dedicated test DB.
+cd D:\PayFLow
+.\backend\.venv\Scripts\python.exe -B frontend/qa/isolated_backend.py
+
+# Terminal 2. This environment setting applies only to this shell.
+cd D:\PayFLow\frontend
+$env:VITE_API_BASE_URL = 'http://127.0.0.1:18016'
+npm run dev -- --host 127.0.0.1 --port 5173 --strictPort
+
+# Terminal 3: point to the absolute directory containing the Playwright package.
+cd D:\PayFLow\frontend
+$env:PLAYWRIGHT_MODULE = 'C:\path\to\tooling\node_modules\playwright'
+$env:PAYFLOW_SCREENSHOTS = "$env:TEMP\payflow-phase6-screenshots"
+node qa/phase6-browser.mjs
+```
+
+Ctrl+C the QA backend for its final ledger/data checks, then stop the test Vite
+server. Close terminal 2 or remove its `VITE_API_BASE_URL` before starting the
+normal frontend again. Test schemas are deliberately retained to avoid destructive
+cleanup. Do not point this browser harness at the development API.
+
+For manual checks without changing development balances, use those QA servers
+with two browser profiles. Visit Home → My QR for user A; download the QR. User B
+adds demo funds, chooses Send Money to test direct verification, then Scan QR →
+upload A's PNG → enter amount → Review → Confirm. Check Transactions, open a
+receipt, and refresh A's account/history. Review the sender account before every
+confirmation. Use the normal development server only when you intend to create
+persistent fictional payments.
+
+Known limitations: physical webcam/phone optical scanning and screen-reader
+hardware were not tested; camera permissions/cleanup were exercised with browser
+synthetic media and automated tests. This is not a formal accessibility audit.
+Navigation deliberately does not survive a page refresh, and client-side history
+filters cover loaded pages. All existing session and sandbox security limitations
+continue to apply. Phase 7 now extends this shell with contacts and requests as described above.
+
+## Phase 5 — QR payments (previous phase)
+
+**Show QR → scan/upload → validate → resolve recipient → enter amount → review
+sender/recipient → explicitly confirm → existing transfer → receipt.**
+
+No backend endpoint, database model, or migration was needed for Phase 5. At that handoff Alembic was at
+`0003_payment_engine`. QR content is a public address, never payment authority.
+
+### Canonical versioned payload
+
+```text
+payflow://pay?v=1&upi=recipient-123abc%40payflow
+```
+
+Only this exact grammar is accepted:
+
+- Literal lowercase `payflow://pay`, no path, port, authority credentials, or fragment.
+- Exactly `v=1` followed by `upi`, with no extra or duplicate parameters.
+- UPI local part: 1–40 lowercase ASCII letters/digits/hyphens, starting with a
+  letter/digit. The domain suffix is exactly `%40payflow` (`@` encoded as `%40`).
+- Raw contents are capped at 160 characters before parsing. Whitespace, reordered
+  keys, alternate escaping, double encoding, and unsupported versions are rejected.
+
+The code contains **only version and public UPI ID**. It contains no JWT,
+password, name, amount, note, account number, balance, or private profile field.
+It is not `upi://pay` and is not an official bank/NPCI payment request. Standard
+QR readers can decode its text; PayFlow's in-app scanner handles this sandbox flow.
+
+The parser never navigates, fetches an embedded URL, executes content, or inserts
+QR text as HTML. Self-payments are rejected locally and by the backend. Display
+names/banks come only from authenticated `POST /payments/resolve`, never from the
+QR. "Verified" means resolved in PayFlow's local database, not real bank/KYC
+verification or a signed QR. A printed code can be replaced: always check the
+recipient before confirming.
+
+### Generation, scanning, and resource cleanup
+
+**My QR Code** uses `qrcode` to generate a standard PNG locally when **Show my QR**
+is opened. Dark modules on white, medium error correction, and a four-module quiet
+zone keep it readable; no logo obscures it. The public ID, Copy action, and PNG
+download accompany it. Clipboard failure leaves readable/selectable text.
+
+**Scan QR** and **Upload QR Image** open an accessible native dialog. Camera
+access starts only after **Start camera**, preferring the rear lens without
+requesting a microphone. Opening the dashboard/dialog or choosing upload never
+requests camera access. ZXing is loaded lazily when decoding is actually needed.
+
+Owned tracks and decoding controls stop on recognition (including invalid codes),
+Stop, Close, Escape, unmount, and logout/auth expiry. A late permission grant is
+immediately released after cancellation. Preview initialization is bounded to
+10 seconds after stream acquisition; a stalled preview stops and offers upload.
+The permission prompt itself can wait for a user decision, with Close available.
+Late lookup results cannot populate a recipient after closing the scanner.
+
+Uploads accept PNG/JPEG/WebP up to 5 MB and 4096 × 4096 decoded pixels. Other
+declared formats, including SVG, are rejected. Images are decoded locally through
+temporary blob URLs, revoked on success/error/cancellation. **Image bytes never
+go to FastAPI.** Use one clear QR per image, including its white border.
+
+Camera and clipboard normally require HTTPS or localhost plus browser permission.
+Plain HTTP at a phone's LAN address may not expose the camera; use upload or
+proper HTTPS hosting. Existing backend CORS restrictions were not widened: mobile
+hosting also needs explicitly allowed origins. Modern native-dialog/canvas/media
+browsers are the target. Keyboard focus stays in the modal, Escape closes it,
+and focus returns to the trigger. There is no permission bypass or real UPI-app launch.
+
+### Existing payment integration
+
+`AccountPanel` passes its authenticated account's public display fields to the
+existing `PaymentPanel`. The QR scanner validates an ID and calls recipient
+lookup only. It has no transfer API. After lookup, the form shows the backend's
+name/bank, a read-only UPI ID, and an **empty amount**. The user may choose another
+recipient explicitly.
+
+**Review payment** reuses the existing exact amount rules and resolves identity
+again. Confirmation shows recipient, amount, optional note, and masked sender
+account. Only **Confirm and send** invokes the existing `POST /payments/transfer`.
+The existing UUID key, session-storage recovery, atomic locks, ledger, receipt,
+balance refresh, and history are reused. Unknown outcomes retain the same key and
+payload; scanning/new money actions stay disabled until that intent is resolved.
+
+### Phase 5 files added or changed
+
+| File | Purpose |
+| --- | --- |
+| `frontend/src/qrPayload.ts` | Versioned public payload generation; strict bounds/grammar; self rejection. |
+| `frontend/src/qrMedia.ts` | Lazy PNG generation/ZXing decoding, owned camera sessions, startup timeout, friendly errors, local file limits, cancellation, and blob cleanup. |
+| `frontend/src/MyQrCode.tsx` | Show/hide, readable ID, copy feedback, PNG download, and generation errors. Accepts only an ID, never a token. |
+| `frontend/src/QrScanner.tsx` | Camera/upload dialog, explicit start/stop, keyboard focus, Escape, loading/errors, validation, and cancellation of late results. |
+| `frontend/src/PaymentPanel.tsx` | QR actions, backend-verified selection, amount/review integration, and masked sender details; existing transfer/receipt/retry code remains. |
+| `frontend/src/AccountPanel.tsx` | Supplies the authenticated account's public fields to the payment panel. |
+| `frontend/src/App.css` | Responsive QR card/dialog, white QR presentation, verified recipient, upload styling, and 44px action targets. |
+| `frontend/package.json`, `package-lock.json` | Add `qrcode`, ZXing browser/core, and development-only `@types/qrcode`. Compatible ZXing browser 0.1.5/core 0.21.3 preserve Node 22; the newer line requires Node 24. |
+| `frontend/src/qrPayload.test.ts` | Canonical, malformed, external, version, size, self cases, and a real encoder/decoder QR-matrix round-trip. |
+| `frontend/src/qrMedia.test.ts` | PNG options, permissions/unavailable cameras, track lifecycle, late grants, timeout/late controls, image limits/errors, and cancellation cleanup. |
+| `frontend/src/QrScanner.test.tsx` | Dialog keyboard behavior, explicit camera start/cleanup, upload validation, unknown recipients, copy/download, and generation errors. |
+| `frontend/src/QrPaymentFlow.test.tsx` | QR through existing confirmation/transfer/receipt, insufficient funds, duplicate submits, same-key retries, lookup/auth failures, closed dialogs, and logout. |
+| `frontend/src/test-setup.ts` | Native-dialog shims only for jsdom; real-browser tests use actual browser modal behavior. |
+| `README.md` | Format, architecture, security, camera requirements, runbook, and results. |
+
+Backend files, credentials, secrets, models, migrations, ledger, and API helpers
+were reused without changes. Decoder code is a lazy chunk, not part of the initial
+dashboard download. Phase 6 now organizes these controls into dedicated screens.
+
+### Run and manually verify with two users
+
+Use the backend/frontend commands above. For an existing checkout the only new
+installation is `npm install` in `D:\PayFLow\frontend`. No new migration is required;
+`alembic upgrade head` is still safe and does nothing when already current.
+
+1. User A signs in and creates a demo account if needed. Open **Show my QR** and
+   **Download QR as PNG**. The readable ID and optional Copy action are beneath it.
+2. User B signs in in a second tab/profile, creates an account, and adds a ₹1,000
+   demo funding action if starting from zero.
+3. B chooses **Scan QR → Start camera**, grants permission, and points at A's code.
+   Alternatively choose **Upload QR Image**, then select A's PNG in the dialog.
+4. Verify the resolved name, bank, and UPI ID. No funds have moved. Enter `125.50`
+   and an optional note; choose **Review payment**.
+5. Check recipient, masked sender account, and amount; explicitly choose
+   **Confirm and send ₹125.50**. From fresh balances, B becomes ₹874.50 and A ₹125.50.
+6. A clicks **Refresh accounts** and **Refresh history**. Both users can open their
+   incoming/outgoing entry and see the same transaction ID in the receipt.
+7. Try your own QR, a website/official UPI QR, and a corrupt image: each must fail
+   without navigation/payment. Deny camera permission to see upload guidance.
+   Close/Escape or log out and verify the browser's camera indicator turns off.
+8. For uncertain payment outcomes use **Retry same request**, never another key.
+   The existing account-scoped recovery survives refresh/re-authentication in the
+   tab. QR actions are disabled while the earlier payment remains unresolved.
+
+Manual payments save fictional records intentionally. Automated browser payments
+used a fresh schema in the separate `payflow_phase4_tests` database, never the
+development database. Test schemas were retained, with no destructive cleanup.
+
+### Automated commands and actual verification
+
+```powershell
+cd D:\PayFLow\frontend
+npm install
+npm test
+npm run build
+npm run lint
+```
+
+```powershell
+cd D:\PayFLow\backend
+$env:REGISTER_TEST_POSTGRES = '1'
+.\.venv\Scripts\python.exe -B -m unittest discover -s tests -v
+Remove-Item Env:REGISTER_TEST_POSTGRES
+.\.venv\Scripts\python.exe -m alembic check
+.\.venv\Scripts\python.exe -B reconcile.py
+```
+
+Executed for Phase 5: **99 frontend tests passed**, including all 35 previous
+frontend tests; **58 PostgreSQL tests passed**, including concurrency and all
+backend regressions, with no skips in that run. TypeScript, production build,
+ESLint, and Alembic consistency passed. Runtime dependency audit reported zero
+vulnerabilities; existing development-tool warnings remain. Development rows,
+balances, credentials, and ledger data were compared before/after backend tests
+and were unchanged.
+
+Chromium verified dashboard PNG generation, clipboard/download, actual local
+upload decoding, two-user ₹125.50 transfer only after explicit confirmation,
+exact balances, both histories/receipts, actual-image self/external-URL rejection,
+mobile width without overflow, native dialog keyboard behavior, synthetic-video
+QR recognition, and track cleanup on recognition/close/logout. The isolated QR
+browser payments and development ledger both reconciled without mismatches.
+
+**Hardware limit:** physical webcam/phone scanning could not be tested. Permission
+and lifecycle cases were tested with mocks and native synthetic video streams;
+actual PNG decoding was verified in Chromium. Device lens focus, lighting, mobile
+OS permissions, and individual browsers still need manual checks. A non-producing
+synthetic device exposed a preview stall; startup is now bounded and releases
+tracks before offering upload. QR images are unsigned public addresses, not proof
+of ownership or bank verification. All existing local-development security limits
+continue to apply.
+
+References: [QR encoder](https://github.com/soldair/node-qrcode),
+[ZXing browser decoder](https://github.com/zxing-js/browser), and
+[camera security/permissions](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia).
+
+## Phase 2 foundation files and important code
 
 | File | Role and changes |
 | --- | --- |
@@ -153,7 +804,7 @@ From `D:\PayFLow\backend`:
 ```
 
 Phase 3 introduced `0002_bank_accounts`; the current head is now
-`0003_payment_engine`. These migrations are applied to the configured local
+`0004_contacts_money_requests`. These migrations are applied to the configured local
 database and existing records were preserved. Repeating `upgrade head` is a no-op.
 
 No manual `stamp`, database reset, or `Base.metadata.create_all()` is required.
@@ -407,6 +1058,12 @@ After losing browser storage, inspect server history before intentionally making
 another payment. Production-grade cross-device/offline recovery is future work.
 
 Success shows a receipt, refreshes the exact cached balance, and reloads history.
+The UI compares exact integer paise against the displayed balance before recipient
+lookup and before a new transfer. An unaffordable payment cannot reach confirmation;
+if the balance drops during review, confirmation is disabled. PostgreSQL still
+checks funds under row locks because another request can change the balance.
+Unknown-outcome retries retain their original key and bypass the UI balance check:
+the original request may already have succeeded and reduced the balance.
 Balance refresh errors never reinterpret a confirmed payment as an uncertain
 transfer. Manual account refresh preserves the payment component and pending
 intent; stale account reads cannot overwrite a newer post-payment balance read.
@@ -437,7 +1094,8 @@ is implemented.
 | `README.md` | Phase 4 design, API, runbook, verification, and security tradeoffs. |
 
 User credentials, secrets, existing account columns, and authentication behavior
-are unchanged. No real payment-provider integration or Phase 5 work was added.
+were unchanged by Phase 4. Phase 5 now adds QR recipient selection using that
+same engine; there are still no real payment-provider integrations.
 
 ### API examples using /docs
 
@@ -493,7 +1151,7 @@ screenshots, Authorization headers, or real credentials.
 
 The Phase 4 migration was applied to the configured local database as
 `0003_payment_engine`. Every existing user/account row was compared before/after
-within the migration transaction. Current development data remains **1 user,
+within the migration transaction. The Phase 4 handoff snapshot contained **1 user,
 1 account with its original zero balance, and no demo payment records**.
 
 Backend (PowerShell):
@@ -597,7 +1255,8 @@ them as a testing shortcut.
 - The system funding ledger is a fictional issuer offset; this is not monetary
   backing, settlement, or a production accounting/legal model.
 - One database and fixed INR; no reversals, refunds, scheduled payments,
-  multi-currency, external-provider reconciliation, or QR payments.
+  multi-currency, or external-provider reconciliation. QR recipient selection
+  is now provided by Phase 5 as described above.
 - Three lifetime demo-funding actions per user. No automatic resets or unlimited
   top-ups. Account creation and registration are not production abuse controls.
 - Lookup throttling is a basic authenticated-user fixed window, not full bot/IP

@@ -43,7 +43,7 @@ describe('Simulated bank accounts', () => {
     setupFetch(async () => json([{ ...account, balance: '12345678901234.56' }]))
     render(<AccountPanel token="test-token" onLogout={vi.fn()} />)
     await screen.findByRole('article', { name: 'Simulated bank account' })
-    expect(screen.getByText('₹12345678901234.56')).toBeTruthy()
+    expect(screen.getByText('₹1,23,45,67,89,01,234.56')).toBeTruthy()
     expect(screen.getByText(account.masked_account_number)).toBeTruthy()
     expect(screen.getByText(account.upi_id)).toBeTruthy()
     expect(screen.getByText(/Fictional funds/)).toBeTruthy()

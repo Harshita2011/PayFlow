@@ -13,6 +13,8 @@ const json = (body: unknown, status = 200) => new Response(JSON.stringify(body),
 function mockAuthFetch(fetchMock: (url: string, options?: RequestInit) => unknown, accounts: BankAccount[] = []) {
   // Keep existing auth tests focused on their auth requests; the dashboard also loads accounts.
   vi.stubGlobal('fetch', (url: string, options?: RequestInit) => {
+    if (url.includes('/payment-requests/')) return Promise.resolve(json({ items: [], next_cursor: null, pending_count: 0 }))
+    if (url.includes('/contacts')) return Promise.resolve(json([]))
     if (url.includes('/payments/history')) return Promise.resolve(json({ items: [], next_cursor: null }))
     if (url.endsWith('/accounts/banks')) return Promise.resolve(json(['Grove Demo Bank']))
     if (url.endsWith('/accounts') && options?.method !== 'POST') return Promise.resolve(json(accounts))
@@ -148,6 +150,7 @@ describe('PayFlow authentication', () => {
       .mockResolvedValueOnce(json({ detail: 'Invalid or expired access token' }, 401)))
     render(<App />)
     await signIn()
+    fireEvent.click(screen.getByRole('button', { name: 'Profile' }))
     fireEvent.click(screen.getByRole('button', { name: 'Refresh profile' }))
     await screen.findByText('Your session has expired. Please sign in again.')
     expect(screen.queryByText(user.email)).toBeNull()
@@ -160,6 +163,7 @@ describe('PayFlow authentication', () => {
     mockAuthFetch(fetchMock)
     render(<App />)
     await signIn()
+    fireEvent.click(screen.getByRole('button', { name: 'Profile' }))
     fireEvent.click(screen.getByRole('button', { name: 'Refresh profile' }))
     fireEvent.click(screen.getByRole('button', { name: 'Log out' }))
     await act(async () => { resolve(json(user)) })

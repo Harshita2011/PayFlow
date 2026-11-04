@@ -14,6 +14,7 @@ from models import BankAccount, User
 from payment_models import LedgerEntry, Payment, PaymentRequest
 from payment_schemas import FundingRequest, PaymentHistory, PaymentReceipt, RecipientRequest, RecipientResponse, TransferRequest
 from security import get_current_user
+from social_models import MoneyRequest
 
 router = APIRouter(tags=["Simulated payments"])
 FUNDING_AMOUNT = Decimal("1000.00")
@@ -77,8 +78,10 @@ def post_ledger(db: Session, payment: Payment):
     db.flush()
 
 
-def execute_payment(db: Session, user: User, key: str, kind: str, payload: FundingRequest | TransferRequest):
+def execute_payment(db: Session, user: User, key: str, kind: str, payload: FundingRequest | TransferRequest, *, money_request_id: str | None = None):
     fingerprint = request_fingerprint(kind, payload)
+    if money_request_id:
+        fingerprint = hashlib.sha256(f"collect:{money_request_id}:{fingerprint}".encode()).hexdigest()
     user_id = user.id
     try:
         # ON CONFLICT waits for a concurrent request with the same scoped key.
@@ -93,6 +96,30 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Fundi
             body, status = request.response_body, request.http_status
             db.rollback()
             return JSONResponse(status_code=status, content=body)
+
+        def finish_collect(status, body):
+            # Completes the same scoped reservation even for lifecycle conflicts/replays.
+            request.http_status, request.response_body = status, body
+            db.flush()
+            db.commit()
+            return JSONResponse(status_code=status, content=body)
+
+        collect = None
+        if money_request_id:
+            # Global order: scoped retry key -> collect row -> sorted account rows.
+            # Cancel/decline take only this collect row, never an account or retry-key lock.
+            collect = db.scalar(select(MoneyRequest).where(MoneyRequest.id == money_request_id,
+                MoneyRequest.payer_user_id == user_id).with_for_update().execution_options(populate_existing=True))
+            if collect is None:
+                return finish_collect(404, {"detail": "Request not found"})
+            if collect.status == "PAID":
+                original = db.get(Payment, collect.payment_id)
+                return finish_collect(201, receipt(original, original.sender_account_id).model_dump(mode="json"))
+            now = db.scalar(select(func.clock_timestamp()))
+            if collect.status == "PENDING" and collect.expires_at <= now:
+                collect.status, collect.updated_at = "EXPIRED", now
+            if collect.status != "PENDING":
+                return finish_collect(409, {"detail": "Request is no longer pending or has expired"})
 
         sender = db.scalar(select(BankAccount).where(BankAccount.user_id == user_id))
         if sender is None:
@@ -109,6 +136,14 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Fundi
         sender = locked[sender.id]
         target = locked[target.id] if target else None
         amount = FUNDING_AMOUNT if kind == "DEMO_FUNDING" else payload.amount
+        if collect:
+            now = db.scalar(select(func.clock_timestamp()))
+            if collect.expires_at <= now:
+                collect.status, collect.updated_at = "EXPIRED", now
+                return finish_collect(409, {"detail": "Request has expired"})
+            # Terms came from the immutable request, never from the paying client.
+            if not target or target.user_id != collect.requester_user_id or amount != collect.amount or payload.note != collect.note:
+                return finish_collect(409, {"detail": "Request details do not match"})
         reason, error_status = None, 400
         if kind == "DEMO_FUNDING":
             used = db.scalar(select(func.count()).select_from(Payment).where(
@@ -142,6 +177,9 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Fundi
                 sender.balance -= amount
             target.balance += amount
             post_ledger(db, payment)
+            if collect:
+                posted_at = db.scalar(select(func.clock_timestamp()))
+                collect.status, collect.payment_id, collect.updated_at = "PAID", payment.id, posted_at
         public = receipt(payment, sender.id).model_dump(mode="json")
         request.payment_id = payment.id
         request.http_status = error_status if reason else 201

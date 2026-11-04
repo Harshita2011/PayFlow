@@ -3,13 +3,18 @@ import type { FormEvent } from 'react'
 import { ApiError, createAccount, getAccounts, getDemoBanks } from './api'
 import type { BankAccount } from './api'
 import PaymentPanel from './PaymentPanel'
+import CopyUpi from './CopyUpi'
+import type { DashboardView } from './navigation'
+import { formatMoney } from './formatMoney'
 
 interface Props {
   token: string
   onLogout: (message?: string) => void
+  view?: DashboardView | 'all'
+  onNavigate?: (view: DashboardView) => void
 }
 
-export default function AccountPanel({ token, onLogout }: Props) {
+export default function AccountPanel({ token, onLogout, view = 'all', onNavigate }: Props) {
   const [account, setAccount] = useState<BankAccount | null>(null)
   const [banks, setBanks] = useState<string[]>([])
   const [loading, setLoading] = useState(true)
@@ -84,9 +89,10 @@ export default function AccountPanel({ token, onLogout }: Props) {
 
   return (
     <section className="account-panel" aria-labelledby="accounts-title">
+      <div className="account-overview" hidden={!!account && !['all', 'home', 'account', 'profile'].includes(view)}>
       <div className="account-heading">
         <h3 id="accounts-title">Your demo account</h3>
-        <button type="button" className="text-button" disabled={loading || creating} onClick={refresh}>Refresh accounts</button>
+        <div className="account-controls">{onNavigate && (view === 'home' || view === 'profile') && <button type="button" className="text-button" onClick={() => onNavigate('account')}>Manage account</button>}<button type="button" className="text-button" disabled={loading || creating} onClick={refresh}>Refresh accounts</button></div>
       </div>
       {loading ? <p role="status" className="account-note">Loading your account…</p> : <>
         {error && <p role="alert" className="feedback error">{error} Use Refresh accounts to check the latest state.</p>}
@@ -96,11 +102,12 @@ export default function AccountPanel({ token, onLogout }: Props) {
             <div className="bank-card-heading"><span>{account.bank_name}</span><span className="demo-tag">SIMULATED</span></div>
             <p className="balance-label">Demo balance · INR</p>
             {/* Keep the exact decimal string; do not convert it with Number/parseFloat. */}
-            <p className="account-balance">₹{account.balance}</p>
+            <p className="account-balance">{formatMoney(account.balance)}</p>
             <dl className="account-details">
               <div><dt>Account number</dt><dd>{account.masked_account_number}</dd></div>
               <div><dt>UPI ID · PayFlow sandbox only</dt><dd>{account.upi_id}</dd></div>
             </dl>
+            <CopyUpi upiId={account.upi_id} />
             <p className="bank-disclaimer">Fictional funds. No real bank or UPI connection.</p>
           </article>
         ) : banks.length > 0 && (
@@ -117,7 +124,8 @@ export default function AccountPanel({ token, onLogout }: Props) {
           </div>
         )}
       </>}
-      {account && <PaymentPanel key={account.id} token={token} accountId={account.id} onLogout={onLogout} onBalanceChanged={refreshBalance} />}
+      </div>
+      {account && <PaymentPanel key={account.id} token={token} accountId={account.id} senderAccount={account} onLogout={onLogout} onBalanceChanged={refreshBalance} view={view} onNavigate={onNavigate} />}
     </section>
   )
 }

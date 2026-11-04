@@ -4,6 +4,7 @@ import PaymentPanel from './PaymentPanel'
 import type { PaymentReceipt } from './api'
 
 const recipient = { display_name: 'Recipient Learner', bank_name: 'River Demo Bank', upi_id: 'recipient-123@payflow' }
+const sender = { bank_name: 'Orbit Demo Bank', masked_account_number: 'SIM •••• 9440', upi_id: 'sender@payflow', balance: '2000.00' }
 const receipt: PaymentReceipt = {
   transaction_id: 'payment-test-id', type: 'TRANSFER', direction: 'OUTGOING', status: 'SUCCESS',
   amount: '12.30', currency: 'INR', counterparty_name: recipient.display_name,
@@ -37,6 +38,53 @@ async function review() {
 }
 
 describe('Simulated payments', () => {
+  it.each(['30000', '2000.01'])('blocks an unaffordable amount %s before lookup or confirmation', async (amount) => {
+    const mock = setup()
+    render(<PaymentPanel accountId={3} token="token" senderAccount={sender} onLogout={vi.fn()} onBalanceChanged={vi.fn()} />)
+    fillForm(amount)
+    fireEvent.submit(screen.getByRole('form', { name: 'Send simulated money' }))
+    await screen.findByText('Insufficient simulated funds. Available balance: ₹2,000.00.')
+    expect(screen.queryByText('Confirm your simulated payment')).toBeNull()
+    expect(mock.mock.calls.some(([url]) => url.endsWith('/resolve') || url.endsWith('/transfer'))).toBe(false)
+  })
+
+  it('allows spending the exact balance and disables confirmation if the balance later drops', async () => {
+    const mock = setup()
+    const props = { accountId: 3, token: 'token', onLogout: vi.fn(), onBalanceChanged: vi.fn() }
+    const view = render(<PaymentPanel {...props} senderAccount={sender} />)
+    fillForm('2000.00')
+    fireEvent.submit(screen.getByRole('form', { name: 'Send simulated money' }))
+    const button = await screen.findByRole('button', { name: 'Confirm and send ₹2,000.00' }) as HTMLButtonElement
+    expect(button.disabled).toBe(false)
+    view.rerender(<PaymentPanel {...props} senderAccount={{ ...sender, balance: '1999.99' }} />)
+    expect(button.disabled).toBe(true)
+    fireEvent.click(button)
+    expect(mock.mock.calls.some(([url]) => url.endsWith('/transfer'))).toBe(false)
+    expect(screen.getByRole('alert').textContent).toContain('₹1,999.99')
+  })
+
+  it('retries an uncertain transfer with the same key even after the displayed balance drops', async () => {
+    let sends = 0
+    const mock = setup(async (url) => {
+      if (url.includes('/history')) return json({ items: [], next_cursor: null })
+      if (url.endsWith('/resolve')) return json(recipient)
+      if (++sends === 1) throw new TypeError('Response lost')
+      return json(receipt, 201)
+    })
+    const props = { accountId: 3, token: 'token', onLogout: vi.fn(), onBalanceChanged: vi.fn().mockResolvedValue(undefined) }
+    const view = render(<PaymentPanel {...props} senderAccount={sender} />)
+    await review()
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm and send ₹12.30' }))
+    await screen.findByText('Keep this payment request.')
+    view.rerender(<PaymentPanel {...props} senderAccount={{ ...sender, balance: '0.00' }} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Retry same request' }))
+    await screen.findByText('Simulated payment completed.')
+    const requests = mock.mock.calls.filter(([url]) => url.endsWith('/transfer'))
+    expect(requests).toHaveLength(2)
+    expect(requests[0][1]?.headers).toEqual(requests[1][1]?.headers)
+    expect(requests[0][1]?.body).toEqual(requests[1][1]?.body)
+  })
+
   it('restores the original pending request after remount and never stores the JWT', async () => {
     let calls = 0
     const mock = setup(async (url) => {
@@ -74,7 +122,7 @@ describe('Simulated payments', () => {
     await screen.findByText('No payments yet. Add demo funds to get started.')
     fireEvent.click(screen.getByRole('button', { name: 'Add ₹1,000 demo funds' }))
     await screen.findByText('Simulated funds added successfully.')
-    expect(screen.getByRole('article', { name: 'Payment receipt' }).textContent).toContain('1000.00')
+    expect(screen.getByRole('article', { name: 'Payment receipt' }).textContent).toContain('1,000.00')
     const request = mock.mock.calls.find(([url]) => url.endsWith('/demo/fund'))!
     expect(request[1]?.body).toBe('{}')
     expect((request[1]?.headers as Record<string, string>)['Idempotency-Key']).toBeTruthy()

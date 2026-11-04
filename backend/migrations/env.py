@@ -5,6 +5,7 @@ from config import DATABASE_URL
 from database import Base
 import models  # Register all model metadata for future migration comparisons.
 import payment_models
+import social_models
 
 
 target_metadata = Base.metadata

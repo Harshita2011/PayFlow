@@ -45,6 +45,7 @@ export async function apiRequest<T>(path: string, options: RequestInit = {}): Pr
   } catch {
     throw new ApiError('Could not reach PayFlow. Check that the backend is running and try again.', 0)
   }
+  if (response.ok && response.status === 204) return undefined as T
   const data = await response.json().catch(() => null)
   if (!response.ok) {
     const detail = data?.detail

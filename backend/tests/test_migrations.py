@@ -33,10 +33,10 @@ class MigrationTests(unittest.TestCase):
         command.upgrade(self.config, "head")
         command.upgrade(self.config, "head")
         inspector = inspect(self.connection)
-        self.assertEqual(set(inspector.get_table_names()), {"users", "bank_accounts", "alembic_version", "ledger_accounts", "payments", "ledger_entries", "payment_requests", "recipient_lookup_limits"})
+        self.assertEqual(set(inspector.get_table_names()), {"users", "bank_accounts", "alembic_version", "ledger_accounts", "payments", "ledger_entries", "payment_requests", "recipient_lookup_limits", "contacts", "money_requests", "request_creation_limits"})
         balance = next(c for c in inspector.get_columns("bank_accounts") if c["name"] == "balance")
         self.assertEqual((balance["type"].precision, balance["type"].scale), (18, 2))
-        self.assertEqual(self.connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one(), "0003_payment_engine")
+        self.assertEqual(self.connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one(), "0004_contacts_money_requests")
         command.check(self.config)
 
     def test_existing_users_are_adopted_without_changes(self):
