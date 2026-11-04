@@ -98,6 +98,7 @@ export interface Recipient {
 }
 
 export interface TransferInput {
+  channel?: 'QR'
   upi_id: string
   amount: string
   note: string
@@ -113,7 +114,8 @@ export interface SelfTransferInput {
 
 export interface PaymentReceipt {
   transaction_id: string
-  type: 'TRANSFER' | 'DEMO_FUNDING' | 'SELF_TRANSFER'
+  type: 'TRANSFER' | 'DEMO_FUNDING' | 'SELF_TRANSFER' | 'MOBILE_RECHARGE' | 'BILL_PAYMENT'
+  channel?: 'QR' | 'REQUEST' | null
   direction: 'INCOMING' | 'OUTGOING' | 'FUNDING' | 'SELF'
   status: 'SUCCESS' | 'FAILED'
   amount: string

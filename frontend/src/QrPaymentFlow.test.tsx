@@ -64,7 +64,7 @@ describe('QR to existing atomic payment flow', () => {
     await screen.findByText('Simulated payment completed.')
     expect(within(screen.getByRole('article', { name: 'Payment receipt' })).getByText(/qr-transfer-id/)).toBeTruthy()
     const sent = mock.mock.calls.find(([url]) => url.endsWith('/transfer'))!
-    expect(JSON.parse(String(sent[1]?.body))).toEqual({ upi_id: recipient.upi_id, amount: '125.50', note: '' })
+    expect(JSON.parse(String(sent[1]?.body))).toEqual({ upi_id: recipient.upi_id, amount: '125.50', note: '', channel: 'QR' })
     expect(balance).toHaveBeenCalledOnce()
   })
 

@@ -1,4 +1,4 @@
-export type DashboardView = 'home' | 'send' | 'scan' | 'qr' | 'transactions' | 'account' | 'profile' | 'contacts' | 'request' | 'requests' | 'split-create' | 'splits' | 'self'
+export type DashboardView = 'home' | 'send' | 'scan' | 'qr' | 'transactions' | 'account' | 'profile' | 'contacts' | 'request' | 'requests' | 'split-create' | 'splits' | 'self' | 'bills'
 
 export const destinations: { id: DashboardView; label: string; icon: string; description: string }[] = [
   { id: 'home', label: 'Home', icon: 'home', description: 'Your money, at a glance. All simulated.' },
@@ -8,6 +8,7 @@ export const destinations: { id: DashboardView; label: string; icon: string; des
   { id: 'contacts', label: 'Contacts', icon: 'user', description: 'Your private address book, favorites, and recent contacts.' },
   { id: 'split-create', label: 'Split Expenses', icon: 'user', description: 'Record an external expense and request exact fictional contributions.' },
   { id: 'splits', label: 'My Splits', icon: 'history', description: 'Created and shared expenses, contribution progress, and settlement history.' },
+  { id: 'bills', label: 'Bills & Recharge', icon: 'bank', description: 'Fictional prepaid plans and utility bills. No real service is provided.' },
   { id: 'self', label: 'Transfer to Self', icon: 'bank', description: 'Move simulated funds between your own accounts. No change to your total funds.' },
   { id: 'scan', label: 'Scan QR', icon: 'scan', description: 'Scan a PayFlow code to find a verified recipient.' },
   { id: 'qr', label: 'My QR', icon: 'qr', description: 'Your public PayFlow identity, ready to share.' },

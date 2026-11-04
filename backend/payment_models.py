@@ -11,7 +11,7 @@ from database import Base
 class LedgerAccount(Base):
     __tablename__ = "ledger_accounts"
     __table_args__ = (CheckConstraint(
-        "(id = 'demo-funding' AND bank_account_id IS NULL) OR "
+        "(id IN ('demo-funding','settlement-recharge','settlement-bills') AND bank_account_id IS NULL) OR "
         "(bank_account_id IS NOT NULL AND id = 'bank-' || CAST(bank_account_id AS TEXT))",
         name="ck_ledger_account_identity",
     ),)
@@ -24,14 +24,16 @@ class Payment(Base):
     __table_args__ = (
         CheckConstraint("amount > 0 AND amount <= 9999999999999999.99", name="ck_payment_amount"),
         CheckConstraint("currency = 'INR'", name="ck_payment_currency"),
-        CheckConstraint("type IN ('TRANSFER', 'DEMO_FUNDING', 'SELF_TRANSFER')", name="ck_payment_type"),
+        CheckConstraint("type IN ('TRANSFER', 'DEMO_FUNDING', 'SELF_TRANSFER','MOBILE_RECHARGE','BILL_PAYMENT')", name="ck_payment_type"),
         CheckConstraint("status IN ('SUCCESS', 'FAILED')", name="ck_payment_status"),
         CheckConstraint(
-            "status = 'FAILED' OR (recipient_account_id IS NOT NULL AND "
+            "status = 'FAILED' OR (type IN ('MOBILE_RECHARGE','BILL_PAYMENT') AND sender_account_id IS NOT NULL AND recipient_account_id IS NULL AND settlement_ledger_account_id IS NOT NULL) OR (settlement_ledger_account_id IS NULL AND recipient_account_id IS NOT NULL AND "
             "((type = 'DEMO_FUNDING' AND sender_account_id IS NULL) OR "
             "(type IN ('TRANSFER','SELF_TRANSFER') AND sender_account_id IS NOT NULL AND sender_account_id <> recipient_account_id)))",
             name="ck_payment_participants",
         ),
+        CheckConstraint("channel IS NULL OR (type='TRANSFER' AND channel IN ('QR','REQUEST'))", name="ck_payment_channel"),
+        CheckConstraint("settlement_ledger_account_id IS NULL OR (type='MOBILE_RECHARGE' AND settlement_ledger_account_id='settlement-recharge') OR (type='BILL_PAYMENT' AND settlement_ledger_account_id='settlement-bills')", name="ck_payment_settlement"),
         Index("ix_payments_sender_history", "sender_account_id", "created_at", "id"),
         Index("ix_payments_recipient_history", "recipient_account_id", "created_at", "id"),
     )
@@ -39,6 +41,8 @@ class Payment(Base):
     actor_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
     sender_account_id: Mapped[int | None] = mapped_column(ForeignKey("bank_accounts.id", ondelete="RESTRICT"))
     recipient_account_id: Mapped[int | None] = mapped_column(ForeignKey("bank_accounts.id", ondelete="RESTRICT"))
+    settlement_ledger_account_id: Mapped[str | None] = mapped_column(ForeignKey("ledger_accounts.id", ondelete="RESTRICT"))
+    channel: Mapped[str | None] = mapped_column(String(16))
     amount: Mapped[Decimal] = mapped_column(Numeric(18, 2))
     currency: Mapped[str] = mapped_column(String(3), default="INR")
     type: Mapped[str] = mapped_column(String(16))

@@ -22,6 +22,7 @@ class RecipientRequest(BaseModel):
 
 
 class TransferRequest(RecipientRequest):
+    channel: Literal["QR"] | None = None
     source_account_id: int | None = Field(default=None, gt=0, strict=True)
     amount: Decimal = Field(gt=0, le=Decimal("100000.00"), max_digits=18, decimal_places=2)
     note: str = Field(default="", max_length=140)
@@ -76,7 +77,8 @@ class RecipientResponse(BaseModel):
 
 class PaymentReceipt(BaseModel):
     transaction_id: str
-    type: Literal["TRANSFER", "DEMO_FUNDING", "SELF_TRANSFER"]
+    type: Literal["TRANSFER", "DEMO_FUNDING", "SELF_TRANSFER", "MOBILE_RECHARGE", "BILL_PAYMENT"]
+    channel: Literal["QR", "REQUEST"] | None = None
     direction: Literal["INCOMING", "OUTGOING", "FUNDING", "SELF"]
     status: Literal["SUCCESS", "FAILED"]
     amount: Decimal

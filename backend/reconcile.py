@@ -13,7 +13,7 @@ def reconcile(connection):
         GROUP BY p.id HAVING
         (p.status='SUCCESS' AND (count(e.payment_id)<>2 OR coalesce(sum(e.amount),0)<>0 OR
         count(*) FILTER (WHERE e.amount=-p.amount AND e.ledger_account_id=CASE WHEN p.type='DEMO_FUNDING' THEN 'demo-funding' ELSE 'bank-' || p.sender_account_id END)<>1 OR
-        count(*) FILTER (WHERE e.amount=p.amount AND e.ledger_account_id='bank-' || p.recipient_account_id)<>1))
+        count(*) FILTER (WHERE e.amount=p.amount AND e.ledger_account_id=coalesce(p.settlement_ledger_account_id,'bank-' || p.recipient_account_id))<>1))
         OR (p.status='FAILED' AND count(e.payment_id)<>0)""")).scalars().all()
     self_invalid = connection.execute(text("""SELECT p.id FROM payments p
         JOIN bank_accounts s ON s.id=p.sender_account_id JOIN bank_accounts t ON t.id=p.recipient_account_id
@@ -37,7 +37,12 @@ def reconcile(connection):
           (s.status='CANCELLED' AND count(*) FILTER(WHERE r.status IN ('PENDING','PAID'))>0)""")).scalars().all()
     primary_invalid = connection.execute(text("""SELECT user_id FROM bank_accounts GROUP BY user_id
         HAVING count(*)>4 OR count(*) FILTER(WHERE is_primary)<>1""")).scalars().all()
-    return {"balanced": net == 0, "account_mismatches": mismatches, "invalid_postings": invalid,
+    service_invalid = connection.execute(text("""SELECT p.id FROM payments p WHERE p.status='SUCCESS' AND (
+        (p.type='MOBILE_RECHARGE' AND (SELECT count(*) FROM mobile_recharges r WHERE r.payment_id=p.id AND r.user_id=p.actor_user_id AND r.status='COMPLETED')<>1)
+        OR (p.type='BILL_PAYMENT' AND (SELECT count(*) FROM utility_bills b WHERE b.payment_id=p.id AND b.user_id=p.actor_user_id AND b.status='PAID' AND b.amount_due=p.amount)<>1))
+        UNION SELECT r.id FROM mobile_recharges r LEFT JOIN payments p ON p.id=r.payment_id WHERE p.id IS NULL OR p.type<>'MOBILE_RECHARGE' OR p.status<>'SUCCESS' OR p.actor_user_id<>r.user_id
+        UNION SELECT b.id FROM utility_bills b LEFT JOIN payments p ON p.id=b.payment_id WHERE b.status='PAID' AND (p.id IS NULL OR p.type<>'BILL_PAYMENT' OR p.status<>'SUCCESS' OR p.actor_user_id<>b.user_id OR p.amount<>b.amount_due)""")).scalars().all()
+    return {"invalid_service_links": service_invalid, "balanced": net == 0, "account_mismatches": mismatches, "invalid_postings": invalid,
         "invalid_self_transfers": self_invalid, "invalid_request_links": request_invalid,
         "invalid_splits": split_invalid, "invalid_primary_accounts": primary_invalid}
 

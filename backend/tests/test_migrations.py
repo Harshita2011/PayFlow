@@ -33,10 +33,10 @@ class MigrationTests(unittest.TestCase):
         command.upgrade(self.config, "head")
         command.upgrade(self.config, "head")
         inspector = inspect(self.connection)
-        self.assertEqual(set(inspector.get_table_names()), {"users", "bank_accounts", "alembic_version", "ledger_accounts", "payments", "ledger_entries", "payment_requests", "recipient_lookup_limits", "contacts", "money_requests", "request_creation_limits", "money_request_destinations", "expense_splits", "expense_split_participants", "split_request_links"})
+        self.assertEqual(set(inspector.get_table_names()), {"users", "bank_accounts", "alembic_version", "ledger_accounts", "payments", "ledger_entries", "payment_requests", "recipient_lookup_limits", "contacts", "money_requests", "request_creation_limits", "money_request_destinations", "expense_splits", "expense_split_participants", "split_request_links", "demo_operators", "demo_recharge_plans", "demo_billers", "mobile_recharges", "utility_bills", "saved_billers"})
         balance = next(c for c in inspector.get_columns("bank_accounts") if c["name"] == "balance")
         self.assertEqual((balance["type"].precision, balance["type"].scale), (18, 2))
-        self.assertEqual(self.connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one(), "0006_multiple_accounts")
+        self.assertEqual(self.connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one(), "0007_bills_recharge")
         command.check(self.config)
 
     def test_existing_users_are_adopted_without_changes(self):
@@ -79,7 +79,7 @@ class MigrationTests(unittest.TestCase):
             VALUES ('legacy-request',1,2,12.34,'Lunch','PAID','legacy-transfer','legacy-key',repeat('a',64),CURRENT_TIMESTAMP+interval '7 days')"""))
         names = ["users", "bank_accounts", "payments", "ledger_entries", "money_requests"]
         def snapshot():
-            return {name: sorted(self.connection.execute(text(f"SELECT (to_jsonb(t)-'is_primary')::text FROM {name} t")).scalars()) for name in names}
+            return {name: sorted(self.connection.execute(text(f"SELECT (to_jsonb(t)-'is_primary'-'settlement_ledger_account_id'-'channel')::text FROM {name} t")).scalars()) for name in names}
         before = snapshot()
         command.upgrade(self.config, "head")
         self.assertEqual(snapshot(), before)

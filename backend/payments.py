@@ -17,10 +17,12 @@ from security import get_current_user
 from social_models import MoneyRequest
 from accounts import lock_account_config
 from split_service import lock_linked_split, linked_request_is_current, settle_if_paid
+from commerce_schemas import RechargeInput, BillPayInput
 
 router = APIRouter(tags=["Simulated payments"])
 FUNDING_AMOUNT = Decimal("1000.00")
 FUNDING_LIMIT = 3
+PaymentInput = FundingRequest | TransferRequest | SelfTransferRequest | RechargeInput | BillPayInput
 
 
 def receipt(payment: Payment, viewer_account_id: int) -> PaymentReceipt:
@@ -28,15 +30,15 @@ def receipt(payment: Payment, viewer_account_id: int) -> PaymentReceipt:
     funding = payment.type == "DEMO_FUNDING"
     self_transfer = payment.type == "SELF_TRANSFER"
     return PaymentReceipt(
-        transaction_id=payment.id, type=payment.type, status=payment.status,
+        transaction_id=payment.id, type=payment.type, status=payment.status, channel=payment.channel,
         direction="SELF" if self_transfer else "FUNDING" if funding else "INCOMING" if incoming else "OUTGOING",
         amount=payment.amount,
         counterparty_name="Transfer between your accounts" if self_transfer else payment.sender_name if incoming else payment.recipient_name,
         counterparty_upi_id=payment.sender_upi_id if incoming else payment.recipient_upi_id,
         recipient_upi_id=payment.recipient_upi_id, note=payment.note,
         failure_reason=payment.failure_reason, created_at=payment.created_at,
-        source_bank=payment.sender_account.bank_name if self_transfer else None,
-        source_masked_account="SIM •••• •••• •••• " + payment.sender_account.account_number[-4:] if self_transfer else None,
+        source_bank=payment.sender_account.bank_name if self_transfer or payment.settlement_ledger_account_id else None,
+        source_masked_account="SIM •••• •••• •••• " + payment.sender_account.account_number[-4:] if self_transfer or payment.settlement_ledger_account_id else None,
         destination_bank=payment.recipient_account.bank_name if self_transfer else None,
         destination_masked_account="SIM •••• •••• •••• " + payment.recipient_account.account_number[-4:] if self_transfer else None,
     )
@@ -73,7 +75,7 @@ def charge_lookup(db, user_id, cost=1):
         raise HTTPException(status_code=429, detail="Too many recipient lookups. Try again next minute", headers={"Retry-After": "60"})
 
 
-def request_fingerprint(kind: str, payload: FundingRequest | TransferRequest | SelfTransferRequest) -> str:
+def request_fingerprint(kind: str, payload: PaymentInput) -> str:
     data = payload.model_dump(mode="json", exclude_none=True)
     if kind in {"TRANSFER", "SELF_TRANSFER"}:
         data["amount"] = format(payload.amount, ".2f")
@@ -84,15 +86,18 @@ def post_ledger(db: Session, payment: Payment):
     debit = "demo-funding" if payment.type == "DEMO_FUNDING" else f"bank-{payment.sender_account_id}"
     db.add_all([
         LedgerEntry(payment_id=payment.id, ledger_account_id=debit, amount=-payment.amount),
-        LedgerEntry(payment_id=payment.id, ledger_account_id=f"bank-{payment.recipient_account_id}", amount=payment.amount),
+        LedgerEntry(payment_id=payment.id, ledger_account_id=payment.settlement_ledger_account_id or f"bank-{payment.recipient_account_id}", amount=payment.amount),
     ])
     db.flush()
 
 
-def execute_payment(db: Session, user: User, key: str, kind: str, payload: FundingRequest | TransferRequest | SelfTransferRequest, *, money_request_id: str | None = None):
+def execute_payment(db: Session, user: User, key: str, kind: str, payload: PaymentInput, *, money_request_id: str | None = None, bill_id: str | None = None):
     fingerprint = request_fingerprint(kind, payload)
     if money_request_id:
         fingerprint = hashlib.sha256(f"collect:{money_request_id}:{fingerprint}".encode()).hexdigest()
+    if bill_id:
+        fingerprint = hashlib.sha256(f"bill:{bill_id}:{fingerprint}".encode()).hexdigest()
+    merchant = kind in {"MOBILE_RECHARGE", "BILL_PAYMENT"}
     user_id = user.id
     try:
         # ON CONFLICT waits for a concurrent request with the same scoped key.
@@ -114,6 +119,19 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Fundi
             db.flush()
             db.commit()
             return JSONResponse(status_code=status, content=body)
+
+        purchase = None
+        if merchant:
+            # Global order: retry key -> bill (or shared catalog) -> owner config -> sorted bank rows.
+            # No code takes a bill lock after an account lock. Settlement has no cached balance to lock.
+            from commerce_service import prepare_purchase
+            try:
+                purchase = prepare_purchase(db, user_id, kind, payload, bill_id)
+            except HTTPException as error:
+                return finish_collect(error.status_code, {"detail": error.detail})
+            if kind == "BILL_PAYMENT" and purchase["bill"].status == "PAID":
+                original = db.get(Payment, purchase["bill"].payment_id)
+                return finish_collect(200, receipt(original, original.sender_account_id).model_dump(mode="json"))
 
         collect = None
         split = None
@@ -137,12 +155,19 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Fundi
                 return finish_collect(409, {"detail": "Request is no longer pending or has expired"})
 
         lock_account_config(db, user_id)
+        if merchant:
+            recent = db.scalar(select(func.count()).select_from(Payment).where(Payment.actor_user_id == user_id,
+                Payment.type.in_(["MOBILE_RECHARGE", "BILL_PAYMENT"]), Payment.created_at > func.clock_timestamp() - text("interval '1 minute'")))
+            if recent >= 10:
+                return finish_collect(429, {"detail": "Too many simulated purchases. Try again next minute"})
         source_id = getattr(payload, "source_account_id", None) or (getattr(payload, "account_id", None) if kind == "DEMO_FUNDING" else None)
         sender = db.scalar(select(BankAccount).where(BankAccount.user_id == user_id,
             BankAccount.id == source_id if source_id is not None else BankAccount.is_primary.is_(True)))
         if sender is None:
             return finish_collect(404, {"detail": "Account not found" if source_id else "Create a simulated bank account first"})
-        if kind == "SELF_TRANSFER":
+        if merchant:
+            target = None
+        elif kind == "SELF_TRANSFER":
             target = db.scalar(select(BankAccount).where(BankAccount.id == payload.destination_account_id, BankAccount.user_id == user_id))
             if target is None:
                 return finish_collect(404, {"detail": "Account not found"})
@@ -154,7 +179,7 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Fundi
             .order_by(BankAccount.id).with_for_update().execution_options(populate_existing=True))}
         sender = locked[sender.id]
         target = locked[target.id] if target else None
-        amount = FUNDING_AMOUNT if kind == "DEMO_FUNDING" else payload.amount
+        amount = purchase["amount"] if merchant else FUNDING_AMOUNT if kind == "DEMO_FUNDING" else payload.amount
         if collect:
             now = db.scalar(select(func.clock_timestamp()))
             if collect.expires_at <= now:
@@ -169,7 +194,7 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Fundi
                 Payment.actor_user_id == user_id, Payment.type == kind, Payment.status == "SUCCESS"))
             if used >= FUNDING_LIMIT:
                 reason, error_status = "Demo funding limit reached (3 actions per user)", 429
-        elif target is None:
+        elif target is None and not merchant:
             reason, error_status = "Recipient not available", 404
         elif kind == "SELF_TRANSFER" and target.id == sender.id:
             reason = "Choose two different accounts"
@@ -184,11 +209,13 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Fundi
             actor_user_id=user_id, sender_account_id=sender.id if kind != "DEMO_FUNDING" else None,
             recipient_account_id=target.id if target else None, amount=amount, currency="INR",
             type=kind, status="FAILED" if reason else "SUCCESS",
+            settlement_ledger_account_id=purchase["settlement"] if merchant else None,
+            channel="REQUEST" if collect else getattr(payload, "channel", None),
             sender_upi_id=sender.upi_id if kind != "DEMO_FUNDING" else None,
-            recipient_upi_id=target.upi_id if target else payload.upi_id,
+            recipient_upi_id=target.upi_id if target else getattr(payload, "upi_id", None),
             sender_name=user.full_name if kind != "DEMO_FUNDING" else "PayFlow demo funding",
-            recipient_name=target.owner.full_name if target else "Unavailable recipient",
-            note=payload.note if kind != "DEMO_FUNDING" else "Fictional test funds",
+            recipient_name=purchase["name"] if merchant else target.owner.full_name if target else "Unavailable recipient",
+            note=purchase["note"] if merchant else payload.note if kind != "DEMO_FUNDING" else "Fictional test funds",
             failure_reason=reason,
         )
         payment.sender_account = sender if kind != "DEMO_FUNDING" else None
@@ -198,8 +225,12 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Fundi
         if not reason:
             if kind != "DEMO_FUNDING":
                 sender.balance -= amount
-            target.balance += amount
+            if target is not None:
+                target.balance += amount
             post_ledger(db, payment)
+            if merchant:
+                from commerce_service import fulfill_purchase
+                fulfill_purchase(db, user_id, payment, payload, purchase)
             if collect:
                 posted_at = db.scalar(select(func.clock_timestamp()))
                 collect.status, collect.payment_id, collect.updated_at = "PAID", payment.id, posted_at

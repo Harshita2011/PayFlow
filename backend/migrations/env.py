@@ -7,6 +7,7 @@ import models  # Register all model metadata for future migration comparisons.
 import payment_models
 import social_models
 import split_models
+import commerce_models
 
 
 target_metadata = Base.metadata

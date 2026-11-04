@@ -1,4 +1,4 @@
-# PayFlow — Phase 8 split expenses and self bank transfers
+# PayFlow — Phase 9 simulated recharge and bill payments
 
 PayFlow is a local UPI payment **simulation** for learning. Phase 2 provides
 registration → login → JWT access token → protected profile → client-side logout.
@@ -14,6 +14,327 @@ Phase 7 adds personal saved contacts, favorites, derived recent contacts, and
 explicitly confirmed money requests using the existing atomic payment engine.
 Phase 8 adds expense obligations, up to four fictional accounts per user,
 primary/source selection and self-transfers through that same ledger engine.
+
+
+## Phase 9: fictional services, the same payment engine
+
+**No telecom service is activated. No real utility bill is settled.** There are
+no telecom, BBPS, NPCI, banking or gateway integrations. Only fictional INR moves
+between the learner's owned bank ledger and a private internal settlement ledger.
+Phases 1–8, original account/UPI routing, the four-account maximum, and the
+**three funding actions per user across all accounts** remain in place.
+
+Open **Bills & Recharge** in the desktop sidebar or the Home/Profile secondary
+shortcuts on mobile. Its secondary buttons provide Mobile Recharge, Utility
+Bills, Saved Billers and Service History without adding mobile bottom tabs.
+Errors and insufficient-funds warnings use the existing red danger style.
+
+### Architecture and accounting
+
+`CommercePanel → commerceApi → authenticated commerce routes → execute_payment`
+is the purchase path. The existing `PaymentPanel` controller owns the retry key,
+confirmation submission, uncertain outcome recovery, receipt and balance/history
+refresh. There is no second payment engine.
+
+The migration adds two `ledger_accounts` rows, `settlement-recharge` and
+`settlement-bills`, each with **no bank account or user**. They cannot log in,
+appear in `/accounts`, receive demo funding, become primary, be selected as
+self-transfer destinations, or be selected by a purchase client. The engine
+chooses the settlement ID from the transaction type. Their balance is the sum
+of their immutable ledger entries; there is no separate settlement balance cache.
+
+For a ₹99 recharge, the shared engine posts `bank-{source}: -99.00` and
+`settlement-recharge: +99.00`. Bill payments similarly credit `settlement-bills`.
+Bank cached balances must equal their own ledger sum. Money is neither created
+nor destroyed by purchases. `NUMERIC(18,2)`, Python `Decimal`, decimal-string JSON
+and frontend integer paise preserve exact money values.
+
+Payment types add `MOBILE_RECHARGE` and `BILL_PAYMENT`. Existing TRANSFER,
+SELF_TRANSFER and DEMO_FUNDING stay compatible. New transfers may carry a `QR`
+channel; request payments receive a server-set `REQUEST` channel. Channels are
+classification, not evidence of identity or authorization. Old payment rows are
+not rewritten, so earlier QR/request transfers can retain a null channel.
+
+### Catalogs and stable bills
+
+* Operators: **PayFlow Mobile**, **NovaTel Demo**, **BlueWave Telecom Demo**.
+* Each has Demo Starter ₹99/7 days, Basic ₹199/28 days, Plus ₹299/28 days,
+  Premium ₹599/84 days, with fictional data/voice descriptions.
+* Billers: **PayFlow Electric Demo**, **ClearWater Utilities Demo**,
+  **HomeGas Demo**, **FiberConnect Demo**; categories Electricity, Water, Gas,
+  Broadband.
+* Demo mobile syntax is ten ASCII digits starting with 6–9. No operator or
+  ownership is inferred from the number. Only its last four digits are retained
+  in the recharge record; the complete number is not stored in payment notes,
+  history, or receipts. Optional `PAYFLOW_DEMO_MOBILE_PREFIXES=6789` configures
+  allowed starting digits in the backend environment; restart the backend after
+  changing it. The operator response supplies the same safe pattern to React,
+  keeping browser and server validation consistent. The default is Indian-style
+  syntax, with no implication that a number actually exists.
+* All utility references are synthetic: `DEMO` plus six digits, e.g.
+  `DEMO000001`. Never enter a real customer reference.
+* Lookup creates one bill per authenticated owner + biller + reference + database
+  calendar month. SHA-256 of biller/reference/month determines an exact
+  ₹100.00–₹500.00 amount in paise. The due date is that month's last day.
+  Repeated lookups return the same stored ID, amount, due date and payment state.
+  A different owner gets a separate bill, even with the same synthetic reference.
+* PAID is stored; OVERDUE is derived only for an unpaid bill past its due date.
+  Past bills remain accessible in history. No background jobs change them.
+* Saved billers retain only the synthetic reference needed for lookup and an
+  optional nickname. Responses mask references; saved-item lookup is performed
+  on the backend, so the full reference need not return to the browser.
+
+### Schema and safe migration
+
+Revision **`0007_bills_recharge`**, after `0006_multiple_accounts`, adds:
+
+| Table/change | Purpose |
+| --- | --- |
+| `demo_operators`, `demo_recharge_plans` | Active fictional catalogs and authoritative Decimal prices |
+| `demo_billers` | Active fictional utility categories/providers |
+| `mobile_recharges` | Immutable completed fulfillment, owner, plan, masked number, unique payment link |
+| `utility_bills` | Owned stable monthly terms, exact due amount, immutable paid state and unique payment link |
+| `saved_billers` | Private address book of synthetic biller/reference pairs, unique per owner |
+| `payments.settlement_ledger_account_id` | Optional private settlement ledger reference |
+| `payments.channel` | Optional QR/request classification for new transfers |
+| Ledger checks/triggers | Permit reserved system ledgers; require balanced postings, owned debits and atomic fulfillment |
+
+All tables use restrictive foreign keys, owner indexes and appropriate uniqueness
+and monetary/state checks. Bill terms are immutable; paid bills and recharges
+cannot be updated or deleted. Deferred checks require each successful purchase
+to have exactly one correct fulfillment at commit, and each fulfillment to link
+to an authorized successful purchase. Existing financial records gain only null
+optional columns. No old balances, references, credentials or UPI IDs are edited.
+
+```powershell
+cd D:\PayFLow\backend
+.\.venv\Scripts\python.exe -m alembic current
+.\.venv\Scripts\python.exe -m alembic upgrade head
+.\.venv\Scripts\python.exe -m alembic check
+.\.venv\Scripts\python.exe -m commerce_seed
+.\.venv\Scripts\python.exe -m reconcile
+```
+
+The migration seeds catalogs automatically. `commerce_seed` is optional and
+repeatable: `ON CONFLICT DO NOTHING` never overwrites existing catalog records.
+There is no startup `create_all`, database reset, or destructive downgrade path.
+Migrations use a bounded lock wait and roll back if a required lock is unavailable.
+
+### Atomicity, concurrency and retries
+
+A purchase uses one PostgreSQL transaction for the scoped idempotency reservation,
+source balance debit, payment, two ledger entries, fulfillment/bill status and
+cached response. Synchronous fictional fulfillment has no external API call or
+untracked post-commit step.
+
+Lock order is **user/key → owned bill (or shared catalog rows) → user account
+configuration advisory lock → bank accounts in increasing ID order**. Existing
+split/request payments keep their split/request locks before account locks. No
+purchase locks a bill after taking a bank lock. Bill lookup never takes bank
+locks. Internal settlement ledgers have no mutable balance to lock. Sufficient
+funds are checked while the source account is locked.
+
+The plan's active status and authoritative price are read under a shared catalog
+lock. Clients send a plan ID, never a price. Bills lock the owned bill and use its
+stored amount. Client amount/status/owner/settlement fields are rejected.
+
+`Idempotency-Key` is a UUID, scoped to the authenticated user and fingerprinted
+with operation, source and relevant plan/number or bill ID. Same key/body returns
+the original response; changed body with the same key returns **409**. Concurrent
+same-key submissions wait on PostgreSQL uniqueness, rather than an in-memory flag.
+Different keys for an already paid owned bill return **200 with the original
+receipt**, not another charge. A new recharge with a new key is intentionally a
+new purchase and always requires a new review.
+
+Known validation/business errors return safe 4xx responses. Money-check failures
+can create an immutable FAILED payment with no ledger entries and no completed
+fulfillment; the bill stays unpaid. That key retains its result, so after funding
+or correcting a known failure, review again and use a fresh key. Transaction,
+deadlock, lock-timeout or uncertain commit errors return **503**: retry the
+**same key/body** to either recover the commit or safely execute after rollback.
+Never generate a new key just because the response was lost.
+
+The frontend saves the exact pending intent in account-scoped `sessionStorage`
+before posting, never the JWT. An unconfirmed mobile intent temporarily includes
+the entered number so an exact retry works; it is cleared on a known result.
+After refresh/re-login the original intent can be retried even if the displayed
+balance is lower because the original request already committed. Account changes
+or navigation cannot retarget that saved payment. Repeating from recharge history
+prefills operator/plan, asks for the number again, and requires fresh confirmation.
+
+Lookup and saved-biller creation share the existing database-backed **10/minute
+per-user lookup** budget; purchases allow **10 new attempts/minute/user** across
+both types. Same-key replays bypass creation throttling. Storage is bounded to
+100 generated bills and 20 saved references per user. Authenticated endpoints
+return safe 404 for another user's records and expose masked identifiers only.
+
+### Phase 9 APIs
+
+All below require `Authorization: Bearer <token>`. Money-changing endpoints also
+require `Idempotency-Key: <uuid>`.
+
+| Method/path | Purpose |
+| --- | --- |
+| GET `/recharge/operators` | Active fictional operators |
+| GET `/recharge/plans?operator_id=payflow-mobile` | Active server-priced plans |
+| POST `/recharge` | Confirmed purchase; returns payment receipt |
+| GET `/recharge/history?limit=10&before=<id>` | Owned completed recharge history, stable cursor |
+| GET `/recharge/{id}` | Owned recharge with linked receipt |
+| GET `/billers` | Active fictional providers and reference format |
+| POST `/bills/lookup` | Stable owned monthly demo bill |
+| GET `/bills` or `/bills/history` | Owned unpaid/paid bills, cursor pagination; `paid_only=true` filters |
+| GET `/bills/{id}` | Owned bill details and optional receipt |
+| POST `/bills/{id}/pay` | Atomic payment and paid transition, or original receipt |
+| GET/POST `/saved-billers` | View/save synthetic references |
+| POST `/saved-billers/{id}/lookup` | Fetch current bill without returning the full saved reference |
+| DELETE `/saved-billers/{id}` | Remove only that owned shortcut; bills/history remain |
+
+Example JSON bodies in FastAPI `/docs`:
+
+```json
+{"mobile":"9876543210","plan_id":"payflow-mobile-99","source_account_id":1}
+```
+```json
+{"biller_id":"electric","reference":"DEMO000001"}
+```
+```json
+{"source_account_id":1}
+```
+```json
+{"biller_id":"electric","reference":"DEMO000001","nickname":"Demo home"}
+```
+
+Use an account ID returned by your own `/accounts`, not the example ID blindly.
+The purchase response is the existing receipt shape with decimal-string `amount`,
+`transaction_id`, `type`, `status`, timestamp, source bank/mask and fictional
+counterparty. No internal settlement ID is returned. The dedicated history wraps
+the linked receipt; main history lists the same payment, without another posting.
+
+### Files added or changed in Phase 9
+
+| File | Responsibility |
+| --- | --- |
+| `backend/commerce_models.py` | Six catalog/owned-record SQLAlchemy models and constraints |
+| `backend/commerce_schemas.py` | Strict input validation and public typed responses; Decimal strings |
+| `backend/commerce_seed.py` | Insert-only deterministic fictional catalogs and CLI |
+| `backend/commerce_service.py` | Locked server-authoritative purchase preparation and fulfillment hooks, no balance writes |
+| `backend/commerce.py` | Authenticated catalogs, owned lookup/history/saved-biller routes; delegates purchases |
+| `backend/migrations/versions/0007_bills_recharge.py` | Forward-only schema, seeds and deferred ledger/fulfillment checks |
+| `backend/migrations/env.py` | Register commerce metadata for Alembic comparison |
+| `backend/payment_models.py`, `payment_schemas.py` | New types, optional settlement/channel and safe receipts |
+| `backend/payments.py` | Extend the existing shared posting/commit/replay path and settlement credit |
+| `backend/config.py` | Safe configurable demo number prefixes, shared with public catalog metadata |
+| `backend/main.py` | Mount routes and prevent caching of service data |
+| `backend/reconcile.py` | Validate system credits and purchase/fulfillment correspondence |
+| `backend/tests/test_commerce.py` | Isolated real-PostgreSQL purchase, privacy, rollback, race and ledger tests |
+| `backend/tests/test_migrations.py` | New head/metadata and preserved legacy financial-row checks |
+| `frontend/src/commerceApi.ts` | Typed service API helpers through existing apiRequest |
+| `frontend/src/CommercePanel.tsx` | Secondary hub, plan selection, lookup, saved billers, review/history/repeat |
+| `frontend/src/PaymentPanel.tsx` | Shared durable purchase intent, retries, posting and receipt integration |
+| `frontend/src/api.ts` | Extended receipt and optional QR-channel types |
+| `frontend/src/PaymentHistory.tsx` | Purchase/channel labels and dedicated type filters |
+| `frontend/src/navigation.ts`, `DashboardShell.tsx` | Desktop entry and mobile Home/Profile shortcuts |
+| `frontend/src/App.css` | Responsive plan cards and existing design/danger styling |
+| `frontend/src/CommercePanel.test.tsx` | Frontend service and shared-controller integration tests |
+| `frontend/src/QrPaymentFlow.test.tsx` | Assert new QR channel while preserving original API/confirmation |
+| `frontend/qa/phase9-browser.mjs` | Real-browser isolated service flow, lost responses and responsive assertions |
+| `README.md` | Architecture, API, operation, verification and limitations |
+
+### Run and test
+
+Use the existing two-terminal run commands below (`8001` backend, `5173`
+frontend), after applying the migration. No new packages were added.
+
+```powershell
+cd D:\PayFLow\backend
+$env:REGISTER_TEST_POSTGRES='1'
+.\.venv\Scripts\python.exe -B -m unittest discover -s tests
+.\.venv\Scripts\python.exe -m alembic check
+.\.venv\Scripts\python.exe -m reconcile
+```
+```powershell
+cd D:\PayFLow\frontend
+npm test
+npm run build
+npm run lint
+```
+
+The PostgreSQL fixtures use a separate `payflow_phase4_tests` database and fresh
+schemas, or rollback-created schemas for migration/authentication tests. They
+never reset development data. Isolated schemas are intentionally retained; no
+automated deletion of them is performed. Reconciliation is read-only.
+
+Browser QA: start `frontend/qa/isolated_backend.py` with the backend Python from
+the repo root; in a separate frontend terminal set
+`$env:VITE_API_BASE_URL='http://127.0.0.1:18016'` and run Vite on port 5173.
+Then run `node qa/phase9-browser.mjs` from frontend with a local Playwright
+installation (`PLAYWRIGHT_MODULE` can point to its installed module directory).
+`PAYFLOW_SCREENSHOTS` optionally chooses an output directory. Stop both QA
+servers afterward, then start the ordinary frontend without that temporary API
+environment variable. The harness blocks writes to every non-isolated backend.
+On backend shutdown it reconciles the test ledger and compares all development
+records against its startup snapshot.
+
+### Manual learning walkthrough
+
+1. Sign in, create an account if needed, and add controlled fictional funds.
+   Existing users keep their balances and their original user-wide funding limit.
+2. Open **Bills & Recharge → Mobile Recharge**. Enter a ten-digit demo number,
+   choose PayFlow Mobile and Demo Starter, and select an owned funded account.
+3. Review the masked number, exact ₹99.00 and source bank. Nothing moves until
+   **Confirm simulated payment**. Check the confirmed receipt and updated balance.
+4. Open **Utility Bills → Electricity**. Choose PayFlow Electric Demo and enter
+   `DEMO000001`. Fetch twice: bill ID/amount remain stable. Optionally save it.
+5. Select the source, review and explicitly confirm. Open the saved biller again:
+   the same month's bill is PAID and links to its original receipt.
+6. Open Service History and Transactions to inspect both purchase classifications.
+   Repeat a recharge to see a fresh plan/number review, without automatic payment.
+7. With a second fictional user, fetch the same synthetic reference: it has an
+   independent owned bill. Neither user can read or pay the other's bill ID.
+8. Run reconciliation. For automated experiments or repeated purchases, use the
+   isolated QA backend; do not populate the persistent development database with
+   test payments without deciding to do so yourself.
+
+### Executed Phase 9 verification (4 November 2026)
+
+| Check | Actual result |
+| --- | --- |
+| PostgreSQL backend suite | **147 passed**, including 31 new commerce/configuration tests and all 116 existing tests |
+| React suite | **165 passed across 11 files**, including 19 new commerce/controller tests |
+| TypeScript and production Vite build | Passed via `npm run build` (`tsc -b` runs first) |
+| ESLint | Passed |
+| Alembic current/check | `0007_bills_recharge (head)`; no new upgrade operations detected |
+| Development reconciliation | Balanced; every mismatch/link/invariant array empty |
+| Isolated payment/QA reconciliation | Passed, including recharge and bill settlement credits |
+| Chromium Phase 8 regression | Passed: three users, split/request contributions, self-transfer retry, primary/UPI routing and real uploaded PNG QR |
+| Chromium Phase 9 | Passed: two source accounts, recharge, saved biller, stable PAID lookup, explicit confirmations, both committed-response retries, receipts/history and logout |
+| Responsive browser assertions | No horizontal overflow at 320, 390, 768, 1024 and 1440 pixels, on service history and loaded recharge form |
+| Existing data | Every pre-existing field/row preserved during migration; 2 users, 2 accounts, 3 payments and 6 ledger entries unchanged |
+| Development service records | Zero recharges, bills and saved billers; no persistent test payments created |
+
+The final frontend run was complete with no skipped files. An earlier run hit a
+Windows `EPERM` opening a jsdom dependency before one worker started; the full
+suite was rerun successfully. Browser checks used headless Chromium with fresh
+isolated PostgreSQL schemas, not physical phones. Both QA servers were stopped
+after verification. Their shutdown reconciliation and development snapshot
+comparisons passed. Screenshots were also inspected at desktop and mobile sizes.
+
+### Known limits
+
+Fulfillment is synchronous and fictional. No SMS, service activation, real bills,
+refunds, recurring billing, external settlement or background workers exist.
+Recharge history contains completed records; known payment failures remain in
+main payment history with no fulfillment. Full mobile numbers are not retained,
+so repeat recharge requires re-entry. Synthetic references are stored in plain
+text because they must match the explicit DEMO-only format, not real customer
+identifiers. Demo catalog edits have no public API; history uses current catalog
+names but immutable payment amounts/snapshots. Catalog seeding never updates terms.
+A month rollover creates a new sample bill without changing the previous bill.
+The storage caps are deliberately small educational limits, not production quotas.
+Rate limits are per authenticated user and supplement, rather than replace,
+production edge abuse controls. Native controls and keyboard-friendly reviews
+reuse the current design; physical mobile devices and assistive technologies
+have not been exhaustively tested. Phase 10 has not been started.
 
 ## Run locally (PowerShell)
 
@@ -401,7 +722,7 @@ on navigation/actions/manual refresh rather than live push. Original external bi
 payment is unverified by design. Small demo request/funding limits and per-actor
 serialization prioritize understandable safety over production throughput. Browser
 automation checked synthetic camera cleanup and real image decoding; physical
-phone-camera and screen-reader hardware were not tested. No Phase 9 work is included.
+phone-camera and screen-reader hardware were not tested. This historical Phase 8 report predates the Phase 9 implementation documented above.
 
 ## Phase 7 — Contacts, recent people and request money (previous phase)
 
