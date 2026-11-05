@@ -1,3 +1,4 @@
+import { configurePin, approvePayment } from './security-helpers.mjs'
 // Optional browser harness. Requires Playwright externally; never targets the development API.
 import { createRequire } from 'node:module'
 import { Buffer } from 'node:buffer'
@@ -24,7 +25,7 @@ async function createUser(page, name, bank) {
   // Guard this script against accidentally creating persistent development payments.
   await page.route('**/*', async (route) => {
     const request = route.request()
-    if (['POST', 'PATCH', 'DELETE'].includes(request.method()) && /\/(register|login|accounts|contacts|payment-requests|splits|demo\/fund|payments\/)/.test(request.url())) {
+    if (['POST', 'PATCH', 'DELETE'].includes(request.method()) && /\/(register|login|accounts|contacts|payment-requests|splits|security|demo\/fund|payments\/)/.test(request.url())) {
       if (!request.url().startsWith('http://127.0.0.1:18016/')) {
         await route.abort()
         throw new Error('QA must use isolated API :18016; request blocked before sending')
@@ -42,6 +43,7 @@ async function createUser(page, name, bank) {
   await waitText(page, 'Account created. Sign in to continue.')
   await page.getByLabel('Password', { exact: true }).fill(password)
   await page.getByRole('button', { name: 'Sign in to PayFlow' }).click()
+  await configurePin(page, password)
   await page.getByLabel('Demo bank').selectOption(bank)
   await page.getByRole('button', { name: 'Create demo account', exact: true }).click()
   await page.getByRole('article', { name: 'Simulated bank account' }).waitFor()
@@ -100,6 +102,7 @@ try {
   assert.equal(transferRequests, 0)
   await shot(b, 'phase6-mobile-confirm')
   await b.getByRole('button', { name: 'Confirm and send ₹12.30' }).click()
+  await approvePayment(b)
   await waitText(b, 'Simulated payment completed.')
   assert.equal(transferRequests, 1)
 
@@ -122,6 +125,7 @@ try {
     else await route.continue()
   })
   await b.getByRole('button', { name: 'Confirm and send ₹125.50' }).click()
+  await approvePayment(b)
   await waitText(b, 'Keep this payment request.')
   await nav(b, 'Transactions')
   await nav(b, 'Home')

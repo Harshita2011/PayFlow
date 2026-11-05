@@ -1,4 +1,4 @@
-export type DashboardView = 'home' | 'send' | 'scan' | 'qr' | 'transactions' | 'account' | 'profile' | 'contacts' | 'request' | 'requests' | 'split-create' | 'splits' | 'self' | 'bills'
+export type DashboardView = 'home' | 'send' | 'scan' | 'qr' | 'transactions' | 'account' | 'profile' | 'contacts' | 'request' | 'requests' | 'split-create' | 'splits' | 'self' | 'bills' | 'security'
 
 export const destinations: { id: DashboardView; label: string; icon: string; description: string }[] = [
   { id: 'home', label: 'Home', icon: 'home', description: 'Your money, at a glance. All simulated.' },
@@ -14,5 +14,6 @@ export const destinations: { id: DashboardView; label: string; icon: string; des
   { id: 'qr', label: 'My QR', icon: 'qr', description: 'Your public PayFlow identity, ready to share.' },
   { id: 'transactions', label: 'Transactions', icon: 'history', description: 'Follow every fictional rupee. View a payment for its receipt.' },
   { id: 'account', label: 'My Bank Accounts', icon: 'bank', description: 'Up to four demo accounts, one primary source, and a user-wide funding allowance.' },
+  { id: 'security', label: 'Security Settings', icon: 'user', description: 'Payment PIN, demo limits, and your security activity.' },
   { id: 'profile', label: 'Profile', icon: 'user', description: 'Your account details and session information.' },
 ]

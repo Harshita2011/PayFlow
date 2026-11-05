@@ -14,6 +14,9 @@ from payments import router as payments_router
 from social import router as social_router
 from splits import router as splits_router
 from commerce import router as commerce_router
+from pin_security import router as pin_security_router
+from security_events import PolicyError, audit, enforce_rate
+from security_settings import settings
 from models import User
 from config import ACCESS_TOKEN_EXPIRE_MINUTES
 from schemas import LoginRequest, RegisterRequest, TokenResponse, UserResponse
@@ -33,6 +36,7 @@ app.include_router(payments_router)
 app.include_router(social_router)
 app.include_router(splits_router)
 app.include_router(commerce_router)
+app.include_router(pin_security_router)
 
 # Allow React frontend to communicate with FastAPI
 app.add_middleware(
@@ -43,8 +47,14 @@ app.add_middleware(
     ],
     allow_credentials=False,
     allow_methods=["GET", "POST", "PATCH", "DELETE"],
-    allow_headers=["Content-Type", "Authorization", "Idempotency-Key"],
+    allow_headers=["Content-Type", "Authorization", "Idempotency-Key", "Payment-Authorization"],
 )
+
+
+@app.exception_handler(PolicyError)
+async def policy_error_handler(request: Request, error: PolicyError):
+    return JSONResponse(status_code=error.status, content={"detail": error.message, "code": error.code, "retry_after": error.retry_after},
+        headers={"Retry-After": str(error.retry_after)} if error.retry_after else None)
 
 
 @app.exception_handler(SQLAlchemyError)
@@ -55,7 +65,7 @@ async def database_error_handler(request: Request, exc: SQLAlchemyError):
 @app.middleware("http")
 async def prevent_auth_caching(request: Request, call_next):
     response = await call_next(request)
-    if request.url.path in {"/register", "/login", "/me", "/accounts", "/contacts", "/payment-requests", "/splits"} or request.url.path.startswith(("/accounts/", "/payments/", "/demo/", "/contacts/", "/payment-requests/", "/splits/", "/recharge", "/bills", "/billers", "/saved-billers")):
+    if request.url.path in {"/register", "/login", "/me", "/accounts", "/contacts", "/payment-requests", "/splits"} or request.url.path.startswith(("/accounts/", "/payments/", "/demo/", "/contacts/", "/payment-requests/", "/splits/", "/recharge", "/bills", "/billers", "/saved-billers", "/security/")):
         response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -71,11 +81,16 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 
 
 @app.post("/register", response_model=UserResponse, status_code=201)
-def register(payload: RegisterRequest, db: Session = Depends(get_db)):
+def register(payload: RegisterRequest, request: Request, db: Session = Depends(get_db)):
+    # Use the socket peer only; arbitrary forwarding headers are not trusted.
+    enforce_rate(db, "register-ip", request.client.host if request.client else "unknown", settings.register_per_ip, 3600)
+    enforce_rate(db, "register-identity", payload.email, 3, 3600)
     existing_user = db.scalar(
         select(User.id).where(func.lower(User.email) == payload.email)
     )
     if existing_user is not None:
+        audit(db, "REGISTRATION_FAILURE", code="REGISTRATION_UNAVAILABLE")
+        db.commit()
         raise HTTPException(status_code=409, detail="Email already registered")
 
     user = User(
@@ -85,6 +100,8 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     )
     db.add(user)
     try:
+        db.flush()
+        audit(db, "REGISTRATION_SUCCESS", user.id, outcome="SUCCESS")
         db.commit()
     except IntegrityError as exc:
         db.rollback()
@@ -99,7 +116,9 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/login", response_model=TokenResponse)
-def login(payload: LoginRequest, db: Session = Depends(get_db)):
+def login(payload: LoginRequest, request: Request, db: Session = Depends(get_db)):
+    enforce_rate(db, "login-ip", request.client.host if request.client else "unknown", settings.login_per_ip, 60)
+    enforce_rate(db, "login-identity", payload.email, settings.login_per_identity, 900)
     user = db.scalar(select(User).where(func.lower(User.email) == payload.email))
     stored_hash = user.password_hash if user else dummy_password_hash
     try:
@@ -107,7 +126,11 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     except (UnknownHashError, ValueError):
         valid = False
     if not valid or user is None:
+        audit(db, "LOGIN_FAILURE", user.id if user else None)
+        db.commit()
         raise unauthorized("Invalid email or password")
+    audit(db, "LOGIN_SUCCESS", user.id, outcome="SUCCESS")
+    db.commit()
     return TokenResponse(
         access_token=create_access_token(user.id),
         expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,

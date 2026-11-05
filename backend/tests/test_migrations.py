@@ -14,7 +14,9 @@ from models import User
 @unittest.skipUnless(os.getenv("REGISTER_TEST_POSTGRES") == "1", "Requires PostgreSQL")
 class MigrationTests(unittest.TestCase):
     def setUp(self):
-        self.engine = create_engine(DATABASE_URL, connect_args={"connect_timeout": 5})
+        from payment_support import PaymentDatabaseTestCase
+        PaymentDatabaseTestCase.setUpClass()
+        self.engine = create_engine(PaymentDatabaseTestCase.test_url, connect_args={"connect_timeout": 5})
         self.connection = self.engine.connect()
         self.transaction = self.connection.begin()
         self.schema = "phase3_test_" + uuid4().hex
@@ -33,10 +35,10 @@ class MigrationTests(unittest.TestCase):
         command.upgrade(self.config, "head")
         command.upgrade(self.config, "head")
         inspector = inspect(self.connection)
-        self.assertEqual(set(inspector.get_table_names()), {"users", "bank_accounts", "alembic_version", "ledger_accounts", "payments", "ledger_entries", "payment_requests", "recipient_lookup_limits", "contacts", "money_requests", "request_creation_limits", "money_request_destinations", "expense_splits", "expense_split_participants", "split_request_links", "demo_operators", "demo_recharge_plans", "demo_billers", "mobile_recharges", "utility_bills", "saved_billers"})
+        self.assertEqual(set(inspector.get_table_names()), {"users", "bank_accounts", "alembic_version", "ledger_accounts", "payments", "ledger_entries", "payment_requests", "recipient_lookup_limits", "contacts", "money_requests", "request_creation_limits", "money_request_destinations", "expense_splits", "expense_split_participants", "split_request_links", "demo_operators", "demo_recharge_plans", "demo_billers", "mobile_recharges", "utility_bills", "saved_billers", "payment_pin_credentials", "payment_authorizations", "payment_limit_counters", "security_rate_windows", "security_audit_events", "fraud_risk_decisions"})
         balance = next(c for c in inspector.get_columns("bank_accounts") if c["name"] == "balance")
         self.assertEqual((balance["type"].precision, balance["type"].scale), (18, 2))
-        self.assertEqual(self.connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one(), "0007_bills_recharge")
+        self.assertEqual(self.connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one(), "0008_payment_security")
         command.check(self.config)
 
     def test_existing_users_are_adopted_without_changes(self):
@@ -85,3 +87,14 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(snapshot(), before)
         self.assertEqual(self.connection.execute(text("SELECT account_id FROM money_request_destinations WHERE request_id='legacy-request'")).scalar_one(), 1)
         self.assertEqual(self.connection.execute(text("SELECT count(*) FROM bank_accounts WHERE is_primary")).scalar_one(), 2)
+        self.assertEqual(self.connection.execute(text("SELECT count(*) FROM payment_pin_credentials")).scalar_one(), 0)
+        # The first daily counter includes pre-security outgoing history, not only new postings.
+        from sqlalchemy.orm import Session
+        from payment_policy import daily_usage
+        from security_events import clock
+        from accounts import lock_account_config
+        with Session(bind=self.connection, join_transaction_mode="create_savepoint") as db:
+            lock_account_config(db, 2)
+            usage = daily_usage(db, 2, clock(db))
+            self.assertEqual(str(usage.amount), "12.34")
+            self.assertEqual(usage.transaction_count, 1)

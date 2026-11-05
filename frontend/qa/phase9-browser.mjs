@@ -1,3 +1,4 @@
+import { configurePin, approvePayment } from './security-helpers.mjs'
 // Real UI with isolated_backend.py. All non-test writes are blocked.
 import { createRequire } from 'node:module'
 import process from 'node:process'
@@ -50,6 +51,7 @@ try {
   await text('Account created. Sign in to continue.')
   await page.getByLabel('Password', { exact: true }).fill('Phase9-Learning-Only!')
   await page.getByRole('button', { name: 'Sign in to PayFlow' }).click()
+  await configurePin(page, 'Phase9-Learning-Only!')
   await page.getByLabel('Demo bank').selectOption('Grove Demo Bank')
   await page.getByRole('button', { name: 'Create demo account', exact: true }).click()
   await page.getByRole('button', { name: 'Add ₹1,000 demo funds' }).click()
@@ -72,6 +74,7 @@ try {
   assert.equal(attempts.recharge.length, 0)
   await text('Review simulated recharge')
   await page.getByRole('button', { name: 'Confirm simulated payment', exact: true }).click()
+  await approvePayment(page)
   await page.getByRole('button', { name: 'Retry same request' }).click()
   await page.getByRole('article', { name: 'Payment receipt', exact: true }).getByText('SUCCESS', { exact: true }).waitFor()
   assert.deepEqual(attempts.recharge[0], attempts.recharge[1])
@@ -91,6 +94,7 @@ try {
   assert.equal(attempts.bill.length, 0)
   await shot('phase9-bill-review')
   await page.getByRole('button', { name: 'Confirm simulated payment' }).click()
+  await approvePayment(page)
   await page.getByRole('button', { name: 'Retry same request' }).click()
   await page.getByRole('article', { name: 'Payment receipt' }).getByText('SIMULATED BILL PAYMENT', { exact: false }).waitFor()
   assert.deepEqual(attempts.bill[0], attempts.bill[1])

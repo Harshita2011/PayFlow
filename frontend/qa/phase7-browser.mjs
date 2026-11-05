@@ -1,3 +1,4 @@
+import { configurePin, approvePayment } from './security-helpers.mjs'
 // Run only with qa/isolated_backend.py and test Vite pointing at :18016.
 import { createRequire } from 'node:module'
 import process from 'node:process'
@@ -35,6 +36,7 @@ async function createUser(page, name) {
   await text(page, 'Account created. Sign in to continue.')
   await page.getByLabel('Password', { exact: true }).fill(password)
   await page.getByRole('button', { name: 'Sign in to PayFlow' }).click()
+  await configurePin(page, password)
   await page.getByLabel('Demo bank').selectOption('Grove Demo Bank')
   await page.getByRole('button', { name: 'Create demo account', exact: true }).click()
   await page.getByRole('article', { name: 'Simulated bank account' }).waitFor()
@@ -102,6 +104,7 @@ try {
     else await route.continue()
   })
   await confirm.getByRole('button', { name: 'Confirm and pay request' }).click()
+  await approvePayment(b)
   await text(b, 'Keep this payment request.')
   const stored = await b.evaluate(() => Object.entries(sessionStorage).find(([key]) => key.startsWith('payflow.pending.'))[1])
   assert.ok(JSON.parse(stored).requestId)

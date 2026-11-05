@@ -1,3 +1,4 @@
+import { approvePin } from './pinTestHelpers'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import PaymentPanel from './PaymentPanel'
@@ -75,6 +76,7 @@ describe('Simulated payments', () => {
     const view = render(<PaymentPanel {...props} senderAccount={sender} />)
     await review()
     fireEvent.click(screen.getByRole('button', { name: 'Confirm and send ₹12.30' }))
+    await approvePin()
     await screen.findByText('Keep this payment request.')
     view.rerender(<PaymentPanel {...props} senderAccount={{ ...sender, balance: '0.00' }} />)
     fireEvent.click(screen.getByRole('button', { name: 'Retry same request' }))
@@ -137,6 +139,7 @@ describe('Simulated payments', () => {
     expect(screen.getByText(recipient.display_name)).toBeTruthy()
     expect(mock.mock.calls.filter(([url]) => url.endsWith('/payments/transfer'))).toHaveLength(0)
     fireEvent.click(screen.getByRole('button', { name: 'Confirm and send ₹12.30' }))
+    await approvePin()
     await screen.findByText('Simulated payment completed.')
     const sent = mock.mock.calls.find(([url]) => url.endsWith('/payments/transfer'))!
     expect(JSON.parse(String(sent[1]?.body))).toEqual({ upi_id: recipient.upi_id, amount: '12.30', note: 'Lunch' })
@@ -176,6 +179,7 @@ describe('Simulated payments', () => {
     render(<PaymentPanel accountId={3} token="token" onLogout={vi.fn()} onBalanceChanged={vi.fn().mockResolvedValue(undefined)} />)
     await review()
     fireEvent.click(screen.getByRole('button', { name: 'Confirm and send ₹12.30' }))
+    await approvePin()
     await screen.findByText('Keep this payment request.')
     expect((screen.getByRole('button', { name: 'Add ₹1,000 demo funds' }) as HTMLButtonElement).disabled).toBe(true)
     expect(sends).toBe(1)
@@ -212,6 +216,7 @@ describe('Simulated payments', () => {
     render(<PaymentPanel accountId={3} token="token" onLogout={vi.fn()} onBalanceChanged={vi.fn()} />)
     await review()
     fireEvent.click(screen.getByRole('button', { name: 'Confirm and send ₹12.30' }))
+    await approvePin()
     await screen.findByText('Insufficient simulated funds')
     expect(screen.getByRole('article', { name: 'Payment receipt' }).textContent).toContain('No funds moved.')
     expect(screen.getByRole('form', { name: 'Send simulated money' })).toBeTruthy()
@@ -227,6 +232,7 @@ describe('Simulated payments', () => {
     render(<PaymentPanel accountId={3} token="token" onLogout={vi.fn()} onBalanceChanged={vi.fn().mockResolvedValue(undefined)} />)
     await review()
     fireEvent.click(screen.getByRole('button', { name: 'Confirm and send ₹12.30' }))
+    await approvePin()
     const button = screen.getByRole('button', { name: 'Sending…' }) as HTMLButtonElement
     expect(button.disabled).toBe(true)
     fireEvent.click(button)

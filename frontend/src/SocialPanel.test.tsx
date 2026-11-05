@@ -1,3 +1,4 @@
+import { approvePin } from './pinTestHelpers'
 import { useState } from 'react'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
@@ -138,7 +139,7 @@ describe('Phase 7 contacts and requests', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Retry same request creation' }))
     await screen.findByText('Request sent. No money moved.')
     const posts = mock.mock.calls.filter(([url, init]) => url.endsWith('/payment-requests') && init?.method === 'POST')
-    expect(posts[0][1]?.headers).toEqual(posts[1][1]?.headers)
+    expect((posts[0][1]?.headers as Record<string, string>)['Idempotency-Key']).toBe((posts[1][1]?.headers as Record<string, string>)['Idempotency-Key'])
     expect(posts[0][1]?.body).toBe(posts[1][1]?.body)
   })
 
@@ -211,6 +212,7 @@ describe('Phase 7 contacts and requests', () => {
     render(<Flow />)
     fireEvent.click(await screen.findByRole('button', { name: 'Pay request' }))
     fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Confirm and pay request' }))
+    await approvePin()
     await screen.findByText('Simulated payment completed.')
     expect(balance).toHaveBeenCalledOnce()
     const posted = mock.mock.calls.filter(([url]) => url.endsWith('/pay'))
@@ -226,6 +228,7 @@ describe('Phase 7 contacts and requests', () => {
     const view = render(element)
     fireEvent.click(await screen.findByRole('button', { name: 'Pay request' }))
     fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Confirm and pay request' }))
+    await approvePin()
     await screen.findByText('Keep this payment request.')
     view.unmount()
     render(element)
@@ -233,7 +236,7 @@ describe('Phase 7 contacts and requests', () => {
     await screen.findByText('Simulated payment completed.')
     const posts = mock.mock.calls.filter(([url]) => url.endsWith('/pay'))
     expect(posts).toHaveLength(2)
-    expect(posts[0][1]?.headers).toEqual(posts[1][1]?.headers)
+    expect((posts[0][1]?.headers as Record<string, string>)['Idempotency-Key']).toBe((posts[1][1]?.headers as Record<string, string>)['Idempotency-Key'])
     expect(posts[0][1]?.body).toBe(posts[1][1]?.body)
   })
 
@@ -242,6 +245,7 @@ describe('Phase 7 contacts and requests', () => {
     render(<PaymentPanel token="token" accountId={3} senderAccount={senderAccount} view="requests" onNavigate={vi.fn()} onLogout={vi.fn()} onBalanceChanged={vi.fn()} />)
     fireEvent.click(await screen.findByRole('button', { name: 'Pay request' }))
     fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Confirm and pay request' }))
+    await approvePin()
     await screen.findByText('Insufficient simulated funds')
     await waitFor(() => expect((screen.getByRole('button', { name: 'Pay request' }) as HTMLButtonElement).disabled).toBe(false))
     expect(screen.getByText('PENDING')).toBeTruthy()

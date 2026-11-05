@@ -94,6 +94,9 @@ def set_primary(account_id: int, user: User = Depends(get_current_user), db: Ses
     accounts = list(db.scalars(select(BankAccount).where(BankAccount.user_id == user.id).order_by(BankAccount.id).with_for_update().execution_options(populate_existing=True)))
     chosen = next((account for account in accounts if account.id == account_id), None)
     if chosen is None:
+        from security_events import audit
+        audit(db, "UNAUTHORIZED_ACCOUNT_ACCESS", user.id, code="ACCOUNT_UNAVAILABLE")
+        db.commit()
         raise HTTPException(404, "Account not found")
     if not chosen.is_primary:
         for account in accounts:
@@ -101,6 +104,8 @@ def set_primary(account_id: int, user: User = Depends(get_current_user), db: Ses
         db.flush()  # Partial uniqueness is immediate; exactly-one is deferred to commit.
         chosen.is_primary = True
         db.flush()
+        from security_events import audit
+        audit(db, "ACCOUNT_PRIMARY_CHANGED", user.id, outcome="SUCCESS")
     db.commit()
     return public_account(chosen)
 
@@ -118,5 +123,8 @@ def get_account(account_id: int, user: User = Depends(get_current_user), db: Ses
     ))
     if account is None:
         # Other users' accounts and nonexistent accounts have the same response.
+        from security_events import audit
+        audit(db, "UNAUTHORIZED_ACCOUNT_ACCESS", user.id, code="ACCOUNT_UNAVAILABLE")
+        db.commit()
         raise HTTPException(status_code=404, detail="Account not found")
     return public_account(account)

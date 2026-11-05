@@ -221,10 +221,10 @@ def cancel(request_id: UUID, payload: FundingRequest, user: User = Depends(get_c
 
 
 @router.post("/payment-requests/{request_id}/pay", response_model=PaymentReceipt, status_code=201)
-def pay_request(request_id: UUID, payload: RequestPayInput, idempotency_key: UUID = Header(), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def pay_request(request_id: UUID, payload: RequestPayInput, idempotency_key: UUID = Header(), payment_authorization: str | None = Header(default=None, max_length=128), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     item = db.scalar(select(MoneyRequest).where(MoneyRequest.id == str(request_id), MoneyRequest.payer_user_id == user.id))
     if item is None:
         raise HTTPException(404, "Request not found")
     account = db.scalar(select(BankAccount).join(RequestDestination, RequestDestination.account_id == BankAccount.id).where(RequestDestination.request_id == item.id))
     transfer = TransferRequest(upi_id=account.upi_id, amount=format(item.amount, ".2f"), note=item.note, source_account_id=payload.source_account_id)
-    return execute_payment(db, user, str(idempotency_key), "TRANSFER", transfer, money_request_id=item.id)
+    return execute_payment(db, user, str(idempotency_key), "TRANSFER", transfer, money_request_id=item.id, authorization_token=payment_authorization)

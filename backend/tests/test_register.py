@@ -14,6 +14,7 @@ from config import DATABASE_URL
 from database import get_db
 from main import app, password_hasher
 from models import BankAccount, User
+from security_models import SecurityRateWindow, SecurityAuditEvent
 
 
 class DatabaseTestCase(unittest.TestCase):
@@ -21,11 +22,20 @@ class DatabaseTestCase(unittest.TestCase):
         # PostgreSQL mode uses an outer transaction: test rows are never committed.
         self.postgres = os.getenv("REGISTER_TEST_POSTGRES") == "1"
         if self.postgres:
-            self.engine = create_engine(
-                DATABASE_URL, connect_args={"connect_timeout": 5}
-            )
+            from payment_support import PaymentDatabaseTestCase
+            from alembic import command
+            from alembic.config import Config
+            from pathlib import Path
+            PaymentDatabaseTestCase.setUpClass()
+            self.engine = create_engine(PaymentDatabaseTestCase.test_url, connect_args={"connect_timeout": 5})
             self.connection = self.engine.connect()
             self.transaction = self.connection.begin()
+            schema = "auth_test_" + uuid4().hex
+            self.connection.exec_driver_sql(f'CREATE SCHEMA "{schema}"')
+            self.connection.exec_driver_sql(f'SET LOCAL search_path TO "{schema}"')
+            config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+            config.attributes["connection"] = self.connection
+            command.upgrade(config, "head")
             self.db = Session(
                 bind=self.connection, join_transaction_mode="create_savepoint",
                 expire_on_commit=False,
@@ -40,6 +50,8 @@ class DatabaseTestCase(unittest.TestCase):
                 connection.execute("PRAGMA foreign_keys=ON")
             User.__table__.create(self.engine)
             BankAccount.__table__.create(self.engine)
+            SecurityRateWindow.__table__.create(self.engine)
+            SecurityAuditEvent.__table__.create(self.engine)
             self.db = Session(self.engine, expire_on_commit=False)
 
         def override_db():
@@ -136,7 +148,7 @@ class RegistrationTests(DatabaseTestCase):
 
     def test_concurrent_duplicate_error_rolls_back(self):
         error = IntegrityError("INSERT", {}, UniqueViolation())
-        with patch.object(self.db, "commit", side_effect=error), patch.object(
+        with patch("main.enforce_rate"), patch.object(self.db, "commit", side_effect=error), patch.object(
             self.db, "rollback", wraps=self.db.rollback
         ) as rollback:
             response = self.client.post("/register", json=self.payload)
@@ -146,7 +158,7 @@ class RegistrationTests(DatabaseTestCase):
 
     def test_other_constraint_errors_are_not_reported_as_duplicates(self):
         error = IntegrityError("INSERT", {}, NotNullViolation())
-        with patch.object(self.db, "commit", side_effect=error), patch.object(
+        with patch("main.enforce_rate"), patch.object(self.db, "commit", side_effect=error), patch.object(
             self.db, "rollback", wraps=self.db.rollback
         ) as rollback:
             response = self.client.post("/register", json=self.payload)
@@ -159,8 +171,9 @@ class RegistrationTests(DatabaseTestCase):
     )
     def test_postgres_unique_constraint_catches_duplicate_after_precheck(self):
         self.assertEqual(self.client.post("/register", json=self.payload).status_code, 201)
+        # Isolate the registration-insert race. SecurityTests separately verifies rate storage.
         # Simulate another request inserting the email after the initial lookup.
-        with patch.object(self.db, "scalar", return_value=None):
+        with patch("main.enforce_rate"), patch.object(self.db, "scalar", return_value=None):
             response = self.client.post("/register", json=self.payload)
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json(), {"detail": "Email already registered"})

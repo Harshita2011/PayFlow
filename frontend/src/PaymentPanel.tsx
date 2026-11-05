@@ -14,6 +14,9 @@ import type { MoneyRequest } from './socialApi'
 import SocialPanel from './SocialPanel'
 import SelfTransferPanel from './SelfTransferPanel'
 import SplitPanel from './SplitPanel'
+import PaymentPinDialog from './PaymentPinDialog'
+import { authorizePayment } from './securityApi'
+import type { AuthorizationCommand } from './securityApi'
 import CommercePanel from './CommercePanel'
 import { payPurchase } from './commerceApi'
 import type { Purchase } from './commerceApi'
@@ -67,6 +70,11 @@ function restoredIntent(accountId: number): Intent | null {
 
 export default function PaymentPanel({ token, accountId, senderAccount, onLogout, onBalanceChanged, view = 'all', onNavigate, accounts = [], sourceAccountId, onLockChanged }: Props) {
   const [busy, setBusy] = useState(false)
+  const [pinIntent, setPinIntent] = useState<Intent | null>(null)
+  const [pinBusy, setPinBusy] = useState(false)
+  const [pinError, setPinError] = useState('')
+  const [pinRetryUntil, setPinRetryUntil] = useState<number | null>(null)
+  const authorization = useRef<{ key: string; token: string } | null>(null)
   const [feedback, setFeedback] = useState('')
   const [feedbackTone, setFeedbackTone] = useState<'error' | 'success'>('error')
   const [recipient, setRecipient] = useState<Recipient | null>(null)
@@ -187,7 +195,44 @@ export default function PaymentPanel({ token, accountId, senderAccount, onLogout
     finally { if (mounted.current) setBusy(false) }
   }
 
-  async function pay(next: Intent) {
+  function closePin() {
+    if (pinBusy) return
+    if (pinIntent) clearPending(accountId, pinIntent.key)
+    setPinIntent(null); setIntent(null); setPinError(''); setPinRetryUntil(null); authorization.current = null
+  }
+
+  async function verifyPaymentPin(pin: string) {
+    if (!pinIntent || pinBusy) return
+    const next = pinIntent
+    const command: AuthorizationCommand = next.kind === 'purchase'
+      ? { operation: next.purchase!.kind === 'recharge' ? 'MOBILE_RECHARGE' : 'BILL_PAYMENT', payload: next.purchase!.kind === 'recharge' ? next.purchase!.recharge! : { source_account_id: next.purchase!.source_account_id }, ...(next.purchase!.billId ? { reference_id: next.purchase!.billId } : {}) }
+      : next.kind === 'self' ? { operation: 'SELF_TRANSFER', payload: next.selfPayload! }
+      : next.kind === 'request' ? { operation: 'REQUEST', payload: next.payload?.source_account_id ? { source_account_id: next.payload.source_account_id } : {}, reference_id: next.requestId }
+      : { operation: 'TRANSFER', payload: next.payload! }
+    setPinBusy(true); setPinError('')
+    try {
+      const grant = await authorizePayment(token, next.key, command, pin)
+      if (!mounted.current) return
+      const expectedAmount = next.kind === 'purchase' ? next.purchase!.amount : next.kind === 'self' ? next.selfPayload!.amount : next.payload!.amount
+      if (grant.amount && canonicalAmount(grant.amount) !== canonicalAmount(expectedAmount)) throw new Error('Payment amount changed. Close this dialog and review the details again.')
+      const expectedSource = next.kind === 'purchase' ? next.purchase!.source_account_id : next.kind === 'self' ? next.selfPayload!.source_account_id : next.payload?.source_account_id
+      if (expectedSource && grant.source_account_id && expectedSource !== grant.source_account_id) throw new Error('Source account changed. Review this payment again.')
+      authorization.current = { key: next.key, token: grant.authorization_token }
+      setPinIntent(null)
+      await pay(next, grant.authorization_token)
+    } catch (error) {
+      if (mounted.current) {
+        if (error instanceof ApiError && error.status === 401) onLogout('Your session has expired. Please sign in again.')
+        else {
+          setPinError(error instanceof Error ? error.message : 'PIN could not be verified.')
+          const body = error instanceof ApiError ? error.responseBody as { retry_after?: number; code?: string } | undefined : undefined
+          if (body?.code === 'PIN_LOCKED' || body?.code === 'RATE_LIMIT_EXCEEDED') setPinRetryUntil(Date.now() + Math.min(body.retry_after || 900, 86400)*1000)
+        }
+      }
+    } finally { if (mounted.current) setPinBusy(false) }
+  }
+
+  async function pay(next: Intent, suppliedGrant?: string) {
     if (posting.current) return
     // An uncertain retry must reach the backend with its original key even if
     // the first attempt already debited the now-lower displayed balance.
@@ -202,12 +247,18 @@ export default function PaymentPanel({ token, accountId, senderAccount, onLogout
       }
       catch (error) { handleError(error); return }
     }
+    const grant = suppliedGrant || (authorization.current?.key === next.key ? authorization.current.token : undefined)
+    if (next.kind !== 'fund' && !next.uncertain && !grant) {
+      setPinIntent(next); setIntent(next); setPinError('')
+      return
+    }
     posting.current = true
     try {
       // Persist BEFORE sending. Only the scoped retry key/payload, never the JWT.
       sessionStorage.setItem(pendingKey(accountId), JSON.stringify(next))
     } catch {
       posting.current = false
+      setIntent(null); authorization.current = null
       setFeedbackTone('error')
       setFeedback('Cannot save the retry key in this tab. Enable browser session storage before sending.')
       return
@@ -217,11 +268,19 @@ export default function PaymentPanel({ token, accountId, senderAccount, onLogout
     setIntent(next)
     let result: PaymentReceipt
     try {
-      result = next.kind === 'purchase' ? await payPurchase(token, next.key, next.purchase!) : next.kind === 'fund' ? await fundDemo(token, next.key, next.fundAccountId) : next.kind === 'request' ? await payMoneyRequest(token, next.requestId!, next.key, next.payload?.source_account_id) : next.kind === 'self' ? await selfTransfer(token, next.key, next.selfPayload!) : await transferMoney(token, next.key, next.payload!)
+      result = next.kind === 'purchase' ? await payPurchase(token, next.key, next.purchase!, grant) : next.kind === 'fund' ? await fundDemo(token, next.key, next.fundAccountId) : next.kind === 'request' ? await payMoneyRequest(token, next.requestId!, next.key, next.payload?.source_account_id, grant) : next.kind === 'self' ? await selfTransfer(token, next.key, next.selfPayload!, grant) : await transferMoney(token, next.key, next.payload!, grant)
     } catch (error) {
       if (mounted.current) {
+        const code = error instanceof ApiError ? (error.responseBody as { code?: string } | undefined)?.code : undefined
+        if (code && ['PAYMENT_AUTHORIZATION_REQUIRED', 'AUTHORIZATION_EXPIRED', 'AUTHORIZATION_MISMATCH', 'PIN_NOT_CONFIGURED'].includes(code)) {
+          authorization.current = null
+          setIntent(next); setPinIntent(next); setPinError(error instanceof Error ? error.message : 'Verify your payment PIN again.')
+          setBusy(false); posting.current = false
+          return
+        }
         if (error instanceof ApiError && error.status >= 400 && error.status < 500 && error.status !== 408) {
           clearPending(accountId, next.key)
+          authorization.current = null
           setIntent(null)
           setRecipient(null)
           const body = error.responseBody as { receipt?: PaymentReceipt } | undefined
@@ -239,6 +298,7 @@ export default function PaymentPanel({ token, accountId, senderAccount, onLogout
       return
     }
     clearPending(accountId, next.key)
+    authorization.current = null
     if (mounted.current) {
       setReceipt(result)
       setIntent(null)
@@ -280,6 +340,7 @@ export default function PaymentPanel({ token, accountId, senderAccount, onLogout
   }
 
   return <section className="payment-panel" aria-labelledby="payments-title">
+    {pinIntent && <PaymentPinDialog busy={pinBusy} error={pinError} retryUntil={pinRetryUntil} onSubmit={verifyPaymentPin} onClose={closePin} onSettings={onNavigate ? () => { closePin(); onNavigate('security') } : undefined} />}
     <h3 id="payments-title" className="sr-only">Your payment sandbox</h3>
     {senderAccount && (view === 'all' || view === 'qr') && <div className="qr-tools surface">
       <MyQrCode upiId={senderAccount.upi_id} initiallyOpen={view === 'qr'} />

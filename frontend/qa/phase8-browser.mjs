@@ -1,3 +1,4 @@
+import { configurePin, approvePayment } from './security-helpers.mjs'
 // Real UI checks with isolated_backend.py; all writes are blocked outside :18016.
 import { createRequire } from 'node:module'
 import process from 'node:process'
@@ -38,6 +39,7 @@ async function user(page, name, bank) {
   await text(page, 'Account created. Sign in to continue.')
   await page.getByLabel('Password', { exact: true }).fill(password)
   await page.getByRole('button', { name: 'Sign in to PayFlow' }).click()
+  await configurePin(page, password)
   await page.getByLabel('Demo bank').selectOption(bank)
   const response = page.waitForResponse((result) => result.url().endsWith('/accounts') && result.request().method() === 'POST')
   await page.getByRole('button', { name: 'Create demo account', exact: true }).click()
@@ -49,8 +51,13 @@ async function user(page, name, bank) {
 }
 async function saveContact(page, person, displayName) {
   await nav(page, 'Contacts')
+  // Wait for the preceding save to release its disabled fieldset before filling.
+  await page.locator('form[aria-label="Find PayFlow user"] fieldset:not([disabled])').waitFor()
   await page.getByLabel('UPI ID to find').fill(person.upi_id)
+  const verified = page.waitForResponse(result => result.url().endsWith('/payments/resolve') && result.request().method() === 'POST')
   await page.getByRole('button', { name: 'Verify user', exact: true }).click()
+  const response = await verified
+  assert.equal(response.status(), 200, `Recipient verification failed: ${await response.text()}`)
   await text(page, `Verified: ${displayName}`)
   await page.getByRole('button', { name: 'Add to saved contacts' }).click()
   await text(page, 'Contact saved to your personal address book.')
@@ -112,6 +119,7 @@ try {
     else await route.continue()
   })
   await a.getByRole('button', { name: 'Confirm self transfer' }).click()
+  await approvePayment(a)
   await text(a, 'Keep this payment request.')
   await nav(a, 'Home')
   assert.equal(await a.getByLabel('Source account').isDisabled(), true)
@@ -145,11 +153,13 @@ try {
   assert.ok((await confirmation.textContent()).includes(added.upi_id))
   await shot(b, 'phase8-mobile-share-confirmation', false)
   await confirmation.getByRole('button', { name: 'Confirm and pay share' }).click()
+  await approvePayment(b)
   await text(b, 'Simulated payment completed.')
   // The third participant pays from Requests: same obligation, same engine.
   await nav(c, 'Requests')
   await c.getByRole('button', { name: 'Pay request' }).click()
   await c.getByRole('dialog').getByRole('button', { name: 'Confirm and pay request' }).click()
+  await approvePayment(c)
   await text(c, 'Simulated payment completed.')
   await nav(a, 'My Splits')
   await a.getByRole('button', { name: /Three-person dinner.*3 people/ }).click()
@@ -189,6 +199,7 @@ try {
   await b.getByLabel('Amount · INR').fill('1.00')
   await b.getByRole('button', { name: 'Review payment' }).click()
   await b.getByRole('button', { name: 'Confirm and send ₹1.00' }).click()
+  await approvePayment(b)
   await text(b, 'Simulated payment completed.')
   await nav(a, 'My Bank Accounts')
   await a.getByRole('button', { name: 'Refresh accounts' }).click()

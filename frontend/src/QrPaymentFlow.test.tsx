@@ -1,3 +1,4 @@
+import { approvePin } from './pinTestHelpers'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import PaymentPanel from './PaymentPanel'
@@ -61,6 +62,7 @@ describe('QR to existing atomic payment flow', () => {
     expect(screen.getByText(/From Grove Demo Bank/).textContent).toContain('1234')
     expect(mock.mock.calls.filter(([url]) => url.endsWith('/transfer'))).toHaveLength(0)
     fireEvent.click(screen.getByRole('button', { name: 'Confirm and send ₹125.50' }))
+    await approvePin()
     await screen.findByText('Simulated payment completed.')
     expect(within(screen.getByRole('article', { name: 'Payment receipt' })).getByText(/qr-transfer-id/)).toBeTruthy()
     const sent = mock.mock.calls.find(([url]) => url.endsWith('/transfer'))!
@@ -73,6 +75,7 @@ describe('QR to existing atomic payment flow', () => {
     panel()
     await reviewQr()
     fireEvent.click(screen.getByRole('button', { name: 'Confirm and send ₹125.50' }))
+    await approvePin()
     await screen.findByText('Insufficient simulated funds')
     expect(screen.getByRole('article', { name: 'Payment receipt' }).textContent).toContain('No funds moved.')
     expect(mock.mock.calls.filter(([url]) => url.endsWith('/transfer'))).toHaveLength(1)
@@ -88,6 +91,7 @@ describe('QR to existing atomic payment flow', () => {
     panel()
     await reviewQr()
     fireEvent.click(screen.getByRole('button', { name: 'Confirm and send ₹125.50' }))
+    await approvePin()
     await screen.findByText('Keep this payment request.')
     expect((screen.getByRole('button', { name: 'Scan QR' }) as HTMLButtonElement).disabled).toBe(true)
     fireEvent.click(screen.getByRole('button', { name: 'Retry same request' }))
@@ -104,6 +108,7 @@ describe('QR to existing atomic payment flow', () => {
     panel()
     await reviewQr()
     fireEvent.click(screen.getByRole('button', { name: 'Confirm and send ₹125.50' }))
+    await approvePin()
     const sending = screen.getByRole('button', { name: 'Sending…' }) as HTMLButtonElement
     expect(sending.disabled).toBe(true)
     fireEvent.click(sending)

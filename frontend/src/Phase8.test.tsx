@@ -1,3 +1,4 @@
+import { approvePin } from './pinTestHelpers'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import AccountPanel from './AccountPanel'
@@ -197,6 +198,7 @@ describe('Phase 8 split and account experience', () => {
     const props = { token: 'token', accountId: 1, sourceAccountId: 1, senderAccount: a, accounts: [a,b], view: 'self' as const, onLogout: vi.fn(), onBalanceChanged: balance }
     const view = render(<PaymentPanel {...props} />)
     selfForm(); fireEvent.click(screen.getByRole('button', { name: 'Confirm self transfer' }))
+    await approvePin()
     await screen.findByText('Keep this payment request.')
     view.unmount()
     render(<PaymentPanel {...props} senderAccount={{ ...a, balance: '300.00' }} accounts={[{ ...a, balance: '300.00' }, { ...b, balance: '700.00' }]} />)
@@ -204,7 +206,7 @@ describe('Phase 8 split and account experience', () => {
     await screen.findByText('Simulated self-transfer completed.')
     const posts = mock.mock.calls.filter(([url]) => url.endsWith('/payments/self-transfer'))
     expect(posts).toHaveLength(2)
-    expect(posts[0][1]?.headers).toEqual(posts[1][1]?.headers)
+    expect((posts[0][1]?.headers as Record<string, string>)['Idempotency-Key']).toBe((posts[1][1]?.headers as Record<string, string>)['Idempotency-Key'])
     expect(posts[0][1]?.body).toBe(posts[1][1]?.body)
     expect(balance).toHaveBeenCalledOnce()
     expect(screen.getByRole('article', { name: 'Payment receipt' }).textContent).toContain('No change to your combined funds')
@@ -274,6 +276,7 @@ describe('Phase 8 split and account experience', () => {
     view.rerender(<PaymentPanel {...props} sourceAccountId={4} senderAccount={b} />)
     expect(screen.getByText(/From Grove Demo Bank/).textContent).toContain('1111')
     fireEvent.click(screen.getByRole('button', { name: 'Confirm and send ₹50.00' }))
+    await approvePin()
     await screen.findByText('Simulated payment completed.')
     const call = mock.mock.calls.find(([url]) => url.endsWith('/payments/transfer'))!
     expect(JSON.parse(String(call[1]?.body)).source_account_id).toBe(1)

@@ -395,3 +395,8 @@ button:focus-visible, a:focus-visible { outline: 3px solid var(--primary); outli
 .commerce-panel :is(h3, h4, p) { margin: 0; }
 .commerce-panel button[aria-pressed='true'] { color: var(--primary); border-color: var(--primary); background: var(--primary-soft); }
 .service-record { display: grid; gap: .75rem; }
+.security-panel { display: grid; gap: 1rem; min-width: 0; }
+.security-panel :is(h2, h3, p) { margin: 0; }
+.security-panel fieldset { display: grid; gap: 1rem; }
+.security-events { list-style: none; padding: 0; margin: 0; }
+.security-events li { padding: 1rem 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }

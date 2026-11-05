@@ -3,6 +3,7 @@ import type { FormEvent } from 'react'
 import { apiRequest, registerUser } from './api'
 import { useAuth } from './useAuth'
 import AccountPanel from './AccountPanel'
+import SecurityPanel from './SecurityPanel'
 import DashboardShell from './DashboardShell'
 import PasswordField from './PasswordField'
 import type { DashboardView } from './navigation'
@@ -96,6 +97,7 @@ function App() {
       <button className="secondary-button" onClick={refreshProfile} disabled={busy}>{busy ? 'Refreshing…' : 'Refresh profile'}</button>
       <p className="account-note">Your token stays in memory. Refreshing the page signs you out. This is a simulated application with no real banking connection.</p>
     </section>
+    {view === 'security' && <SecurityPanel token={auth.session.token} onLogout={auth.logout} />}
     <AccountPanel key={auth.session.token} token={auth.session.token} onLogout={auth.logout} view={view} onNavigate={setView} />
   </DashboardShell>
 

@@ -40,8 +40,8 @@ def plans(operator_id: str = Query(max_length=24), user: User = Depends(get_curr
 
 
 @router.post("/recharge", response_model=PaymentReceipt, status_code=201)
-def recharge(payload: RechargeInput, idempotency_key: UUID = Header(), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    return execute_payment(db, user, str(idempotency_key), "MOBILE_RECHARGE", payload)
+def recharge(payload: RechargeInput, idempotency_key: UUID = Header(), payment_authorization: str | None = Header(default=None, max_length=128), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return execute_payment(db, user, str(idempotency_key), "MOBILE_RECHARGE", payload, authorization_token=payment_authorization)
 
 
 @router.get("/billers", response_model=list[BillerOut])
@@ -125,8 +125,8 @@ def bill_detail(bill_id: UUID, user: User = Depends(get_current_user), db: Sessi
 
 
 @router.post("/bills/{bill_id}/pay", response_model=PaymentReceipt, status_code=201)
-def pay_bill(bill_id: UUID, payload: BillPayInput, idempotency_key: UUID = Header(), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    return execute_payment(db, user, str(idempotency_key), "BILL_PAYMENT", payload, bill_id=str(bill_id))
+def pay_bill(bill_id: UUID, payload: BillPayInput, idempotency_key: UUID = Header(), payment_authorization: str | None = Header(default=None, max_length=128), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return execute_payment(db, user, str(idempotency_key), "BILL_PAYMENT", payload, bill_id=str(bill_id), authorization_token=payment_authorization)
 
 
 def recharge_query(user_id):

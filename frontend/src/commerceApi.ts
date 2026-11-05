@@ -22,9 +22,9 @@ export const getSavedBillers = (token: string) => apiRequest<SavedBiller[]>('/sa
 export const saveBiller = (token: string, biller_id: string, reference: string, nickname: string) => apiRequest<SavedBiller>('/saved-billers', { method: 'POST', headers: headers(token), body: JSON.stringify({ biller_id, reference, nickname }) })
 export const removeBiller = (token: string, id: string) => apiRequest<void>(`/saved-billers/${id}`, { method: 'DELETE', headers: headers(token) })
 export const lookupSaved = (token: string, id: string) => apiRequest<Bill>(`/saved-billers/${id}/lookup`, { method: 'POST', headers: headers(token) })
-export function payPurchase(token: string, key: string, purchase: Purchase) {
+export function payPurchase(token: string, key: string, purchase: Purchase, grant?: string) {
   return apiRequest<PaymentReceipt>(purchase.kind === 'recharge' ? '/recharge' : `/bills/${purchase.billId}/pay`, {
-    method: 'POST', headers: { ...headers(token), 'Idempotency-Key': key },
+    method: 'POST', headers: { ...headers(token), 'Idempotency-Key': key, ...(grant ? { 'Payment-Authorization': grant } : {}) },
     body: JSON.stringify(purchase.kind === 'recharge' ? purchase.recharge : { source_account_id: purchase.source_account_id }),
   })
 }

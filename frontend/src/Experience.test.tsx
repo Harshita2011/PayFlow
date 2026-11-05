@@ -1,3 +1,4 @@
+import { approvePin } from './pinTestHelpers'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import App from './App'
@@ -83,6 +84,7 @@ describe('Phase 6 experience', () => {
     await screen.findByText('Confirm your simulated payment')
     expect(mock.mock.calls.some(([url]) => url.endsWith('/transfer'))).toBe(false)
     fireEvent.click(screen.getByRole('button', { name: 'Confirm and send ₹125.50' }))
+    await approvePin()
     await screen.findByText('Simulated payment completed.')
     expect(screen.getByRole('article', { name: 'Payment receipt' }).textContent).toContain(payment.transaction_id)
   })
@@ -105,6 +107,7 @@ describe('Phase 6 experience', () => {
     fireEvent.change(screen.getByLabelText('Amount · INR'), { target: { value: '125.50' } })
     fireEvent.submit(screen.getByRole('form', { name: 'Send simulated money' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Confirm and send ₹125.50' }))
+    await approvePin()
     await screen.findByText('Keep this payment request.')
     const saved = sessionStorage.getItem('payflow.pending.3')
     fireEvent.click(nav.getByRole('button', { name: 'Transactions' }))

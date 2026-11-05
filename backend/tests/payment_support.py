@@ -1,5 +1,8 @@
 """Real commits and independent sessions in a separate test database, never development data."""
 from pathlib import Path
+from dataclasses import replace
+from unittest.mock import patch
+import re
 from uuid import uuid4
 import unittest
 
@@ -14,10 +17,39 @@ from config import DATABASE_URL
 from database import get_db
 from main import app
 from models import BankAccount, DemoBank, User
-from security import create_access_token
+from security import create_access_token, password_hasher
+from security_models import PinCredential
+from security_settings import settings
+
+
+TEST_PIN = "482951"
+
+
+class PinAwareClient(TestClient):
+    """Legacy regressions still exercise real PIN grants; no backend test bypass exists."""
+    auto_authorize = True
+
+    def post(self, url, **kwargs):
+        headers = dict(kwargs.get("headers") or {})
+        body = kwargs.get("json")
+        operation, reference = None, None
+        if url == "/payments/transfer": operation = "TRANSFER"
+        elif url == "/payments/self-transfer": operation = "SELF_TRANSFER"
+        elif url == "/recharge": operation = "MOBILE_RECHARGE"
+        elif match := re.fullmatch(r"/payment-requests/([^/]+)/pay", str(url)): operation, reference = "REQUEST", match[1]
+        elif match := re.fullmatch(r"/bills/([^/]+)/pay", str(url)): operation, reference = "BILL_PAYMENT", match[1]
+        if self.auto_authorize and operation and isinstance(body, dict) and "Authorization" in headers and "Idempotency-Key" in headers and "Payment-Authorization" not in headers:
+            command = {"pin": TEST_PIN, "operation": operation, "payload": body}
+            if reference: command["reference_id"] = reference
+            grant = super().post("/security/payment-authorizations", json=command, headers=headers)
+            if grant.status_code == 201:
+                kwargs["headers"] = {**headers, "Payment-Authorization": grant.json()["authorization_token"]}
+        return super().post(url, **kwargs)
 
 
 class PaymentDatabaseTestCase(unittest.TestCase):
+    auto_authorize = True
+    relax_security_limits = True
     @classmethod
     def setUpClass(cls):
         source = make_url(DATABASE_URL)
@@ -49,7 +81,20 @@ class PaymentDatabaseTestCase(unittest.TestCase):
                 yield db
 
         app.dependency_overrides[get_db] = override_db
-        self.client = TestClient(app)
+        if self.relax_security_limits:
+            relaxed = replace(settings, daily_amount=__import__('decimal').Decimal("1000000000"), daily_count=10000,
+                risk_velocity=10000, risk_distinct=10000, risk_large=__import__('decimal').Decimal("1000000000"),
+                risk_insufficient=10000, risk_services=10000, risk_new_contact=10000, risk_requests=10000,
+                requests_per_day=10000, pin_per_minute=10000, submit_per_minute=10000)
+            for module in ["payment_policy", "pin_security", "request_limits"]:
+                context = patch(module + ".settings", relaxed)
+                context.start()
+                self.addCleanup(context.stop)
+            context = patch("security_settings.settings", relaxed)
+            context.start()
+            self.addCleanup(context.stop)
+        self.client = PinAwareClient(app)
+        self.client.auto_authorize = self.auto_authorize
         self.accounts = []
         self.headers = []
         with Session(self.engine) as db:
@@ -57,6 +102,8 @@ class PaymentDatabaseTestCase(unittest.TestCase):
                 user = User(full_name=f"Payment Learner {index}", email=f"learner{index}@example.com", password_hash="test-only")
                 db.add(user)
                 db.flush()
+                if self.auto_authorize:
+                    db.add(PinCredential(user_id=user.id, pin_hash=password_hasher.hash(TEST_PIN)))
                 account = BankAccount(user_id=user.id, bank_name=DemoBank.GROVE.value,
                     account_number="SIM" + str(index + 1).zfill(16), upi_id=f"learner-{index}@payflow", is_primary=True)
                 db.add(account)

@@ -45,7 +45,8 @@ The interface exposes these systems through recipient verification, explicit con
 
 | Area | Implemented functionality |
 | --- | --- |
-| Authentication | Registration, Argon2id password hashing, JWT Bearer login, protected profile, client-side logout, and session-expiry handling |
+| Authentication | Registration, Argon2id password hashing, throttled JWT Bearer login, protected profile, client-side logout, and session-expiry handling |
+| Payment security | Separate six-digit PIN, password-authenticated setup, PIN change/temporary lockout, one-payment grants, UTC daily limits, explainable risk rules, and private security activity |
 | Bank accounts and UPI IDs | Up to four fictional accounts per user, primary selection, generated account numbers and unique `@payflow` IDs, masked displays, and exact decimal balances |
 | Payments | Exact-ID recipient lookup, owned source selection, incoming/outgoing transfers, self-transfers, receipts, cursor-paginated history, and retry recovery |
 | Demo funding | ₹1,000 per action, limited to three successful funding actions per user across all their accounts |
@@ -88,7 +89,9 @@ flowchart TD
     API --> Auth["JWT validation and current-user dependency"]
     API --> Features["Accounts, contacts, requests, splits, and commerce"]
     Features --> Engine["Shared execute_payment service"]
-    Engine --> ORM["SQLAlchemy session / psycopg"]
+    Engine --> Policy["Bound grants, UTC limits, and risk rules"]
+    Policy --> ORM["SQLAlchemy session / psycopg"]
+    Engine --> ORM
     Features --> ORM
     Auth --> ORM
     ORM --> PG[("PostgreSQL")]
@@ -111,8 +114,8 @@ These modules form one backend application, not independently deployed microserv
 2. The backend validates the JWT and payload. Client-supplied ownership, balances, settlement IDs, and purchase prices are not accepted.
 3. `execute_payment` reserves a UUID idempotency key scoped to the authenticated user and compares a request fingerprint. A matching completed result is replayed before another posting is attempted.
 4. The engine resolves the UPI destination, owned self-transfer destination, or private settlement ledger. Request/bill terms come from stored records; recharge prices come from active server-side plans.
-5. It locks applicable lifecycle records, obtains the sender's account-configuration advisory lock, and locks affected bank accounts with `SELECT FOR UPDATE` in ascending account-ID order. It checks funds while those locks are held.
-6. A successful operation updates cached bank balances, writes a payment and two matching signed ledger entries, and updates linked obligations/fulfillment within the same PostgreSQL transaction.
+5. It locks applicable lifecycle records, obtains the sender's account-configuration advisory lock, and locks affected bank accounts with `SELECT FOR UPDATE` in ascending ID order. Under those locks it verifies the bound PIN grant, UTC spending allowance, deterministic risk rules, and available funds.
+6. A successful operation consumes its one-payment grant, increments daily usage, updates cached bank balances, writes the payment/two matching ledger entries, and persists linked obligations, fulfillment, and security decisions in the same PostgreSQL transaction.
 7. Deferred constraints validate the posting. The engine stores its response in the idempotency record and commits once; only then is the receipt returned. Transaction failures roll back the operation.
 
 ```mermaid
@@ -122,8 +125,10 @@ sequenceDiagram
     participant API as FastAPI
     participant Engine as Payment service
     participant DB as PostgreSQL
-    User->>UI: Review and explicitly confirm
-    UI->>API: Bearer token, payload, Idempotency-Key
+    User->>UI: Review, confirm, and enter payment PIN
+    UI->>API: Request bound short-lived PIN authorization
+    API-->>UI: One-payment bearer grant
+    UI->>API: JWT, payload, key, and Payment-Authorization
     API->>Engine: Validated request and authenticated user
     Engine->>DB: Reserve scoped key and compare fingerprint
     alt Matching completed request
@@ -131,8 +136,8 @@ sequenceDiagram
         Engine-->>UI: Original receipt or error
     else New request
         Engine->>DB: Lock lifecycle records and ordered accounts
-        Engine->>DB: Validate ownership, terms, and funds
-        Engine->>DB: Write balances, payment, ledger, state, and result
+        Engine->>DB: Validate grant, limits, risk, ownership, and funds
+        Engine->>DB: Consume grant and write usage, ledger, payment, state, audit, and result
         Engine->>DB: Check constraints and commit together
         DB-->>Engine: Commit succeeds
         Engine-->>UI: Confirmed receipt
@@ -156,7 +161,7 @@ Successful postings have two entries totaling zero. Failed payment records have 
 
 - Matching key/payload returns the stored HTTP status/body; changed parameters under the same key return **409**. Database uniqueness coordinates concurrent duplicates across API workers.
 - Different keys cannot pay a paid bill twice: the authorized caller receives the original receipt. Paid money requests similarly recover their existing receipt.
-- Lock order is retry key → applicable split/request or bill/catalog locks → sender configuration → ascending bank-account IDs. Lifecycle actions use the same relevant record locks to coordinate pay/cancel/decline races.
+- Lock order is retry key → submission-rate window → applicable split/request or bill/catalog locks → sender configuration → ascending bank-account IDs. Lifecycle actions use the same relevant record locks to coordinate pay/cancel/decline races.
 - Deadlocks, lock timeouts, and uncertain commit failures return a safe **503** directing the client to retry the **same key and body**. Known business failures retain their results; correcting one requires a freshly reviewed intent.
 - React saves unresolved intent metadata in account-scoped `sessionStorage` before submission, without the JWT. Same-tab retries after re-login preserve source, payload, and key. Recovery is not cross-device.
 
@@ -173,7 +178,9 @@ Successful postings have two entries totaling zero. Failed payment records have 
 | `expense_splits`, `expense_split_participants`, `split_request_links` | External expense totals, shares, current contribution requests, and renewal history |
 | `demo_operators`, `demo_recharge_plans`, `mobile_recharges` | Fictional catalogs and immutable completed recharges with masked numbers and unique payment links |
 | `demo_billers`, `utility_bills`, `saved_billers` | Providers, owned monthly bills, payment links, and saved synthetic references |
-| `recipient_lookup_limits`, `request_creation_limits` | Database-backed lookup/request throttling counters |
+| `recipient_lookup_limits`, `request_creation_limits`, `security_rate_windows` | Shared database-backed request and API throttles |
+| `payment_pin_credentials`, `payment_authorizations` | Argon2id PIN hashes/version/lockout and digest-only, bound, expiring one-payment grants |
+| `payment_limit_counters`, `fraud_risk_decisions`, `security_audit_events` | UTC usage, explainable risk decisions, and restricted structured security activity |
 
 **Naming distinction:** `payment_requests` stores idempotency results; `money_requests` stores requests between people. The simplified diagram omits secondary role-specific foreign keys and catalog details.
 
@@ -205,7 +212,7 @@ Splits are `OPEN`, `SETTLED`, or `CANCELLED`; settlement requires every owed con
 
 Internal funding/settlement accounts are ledger entities, not artificial users or bank accounts. They have no public credentials and cannot appear as selectable funding/self-transfer accounts.
 
-The [migration chain](backend/migrations/versions) has repository head `0007_bills_recharge`. Upgrades preserve history; downgrades are intentionally refused. Normal operation uses migrations, not `Base.metadata.create_all`.
+The [migration chain](backend/migrations/versions) has repository head `0008_payment_security`. Upgrades preserve history; downgrades are intentionally refused. Normal operation uses migrations, not `Base.metadata.create_all`.
 
 ## Security and reliability
 
@@ -220,7 +227,25 @@ The [migration chain](backend/migrations/versions) has repository head `0007_bil
 | QR input | Strict versioned payload, length/UPI validation, no external navigation or credentials, backend recipient resolution, and camera-track cleanup |
 | Auditing | Read-only checks of ledger totals, balances, posting structure, self-transfer conservation, and request/split/service links |
 
-Lookup throttling and request caps are database-backed; service purchases also have a per-user creation limit. These are basic controls, not comprehensive fraud prevention.
+### Payment PIN and one-time authorization
+
+Sensitive payments require a separate six-digit PIN. Initial setup also verifies the account password; changing it requires the current PIN. Obvious sequences/repetitions are rejected, hashes use Argon2id, and five wrong attempts cause a temporary 15-minute lockout by default. Existing users receive no default PIN. There is no forgotten-PIN reset endpoint because independent recovery is unavailable.
+
+After review, React exchanges the PIN for a 120-second random bearer grant through `POST /security/payment-authorizations`. Only its digest is stored. The grant binds the user, source, operation, destination/bill/plan, exact amount, request fingerprint, idempotency key, expiry and PIN version. The original payment endpoint receives it in `Payment-Authorization`; consumption commits with the ledger, not before it. PIN changes invalidate older unconsumed grants. Neither PINs nor grants enter browser storage.
+
+Successful committed retries replay their original result without requiring a fresh grant. A new posting always requires a matching unconsumed grant. After an uncommitted/expired retry, the frontend can obtain a fresh grant under the **same intended key**. Controlled demo funding is an explicit central PIN/daily-spending exemption with its unchanged user-wide allowance and shared rate/audit checks.
+
+### Limits, fraud rules and audit
+
+Defaults are ₹100,000 per payment, ₹200,000/50 outgoing postings per UTC day, and 20 created money/contribution requests per UTC day. Self-transfers count toward outgoing limits; demo funding, failures and idempotent replays do not. Owner locks protect a daily counter initialized from existing committed history. Days reset at **00:00 UTC**, with the posting-decision timestamp sampled after locks.
+
+Rules use committed database state: payment velocity, large amounts, many recipient accounts, repeated insufficient funds, service-purchase velocity, recent PIN failures, new-contact repetition, and request-creation velocity. LOW/MEDIUM may ALLOW; sufficiently high risk BLOCKS with a safe rule explanation and no success receipt. There is no pretend additional-verification challenge or machine learning.
+
+PostgreSQL fixed-window counters protect login, registration, PIN calls and new payment submissions alongside existing lookup/request limits. Socket-peer IP and normalized-identity subjects are HMAC digests. Direct local Uvicorn must use `--no-proxy-headers`; adding a reverse proxy requires an explicit trusted-proxy policy. Counter-store failure denies the action rather than failing open.
+
+Structured events cover login, PIN lifecycle/failure/lockout, blocked/allowed payments, rules, primary changes and access/rate denials. They contain actor/operation IDs and allowlisted codes, never raw credentials, tokens, emails, mobile numbers or customer references. Successful financial decisions audit atomically; blocked decisions audit after financial rollback. Users can read only their own recent events in Security Settings.
+
+See [Security architecture and threat model](docs/SECURITY.md) for rule thresholds, lock ordering, failure semantics, safe retention and residual risks. `security_retention` previews eligible security-only rows; its explicit operator `--apply` mode is never an automatic startup task and preserves financial history and consumed grants.
 
 Logout clears React state but **does not revoke an issued JWT**; it remains valid until expiry. Refresh requires signing in again. Database owners can alter triggers, so production operation would need separate runtime/migration privileges and the additional controls under [Limitations](#limitations).
 
@@ -237,6 +262,9 @@ PayFlow/
 │   ├── splits.py, split_models.py, split_schemas.py, split_service.py
 │   ├── commerce.py, commerce_models.py, commerce_schemas.py
 │   ├── commerce_service.py, commerce_seed.py, reconcile.py
+│   ├── pin_security.py, pin_schemas.py, payment_policy.py
+│   ├── security_models.py, security_events.py, security_settings.py
+│   ├── security_retention.py
 │   ├── migrations/versions/
 │   ├── tests/
 │   ├── alembic.ini, requirements.txt, requirements-dev.txt
@@ -247,6 +275,7 @@ PayFlow/
 │   │   ├── AccountPanel.tsx, PaymentPanel.tsx, PaymentHistory.tsx
 │   │   ├── SocialPanel.tsx, SplitPanel.tsx, SelfTransferPanel.tsx
 │   │   ├── CommercePanel.tsx, MyQrCode.tsx, QrScanner.tsx
+│   │   ├── SecurityPanel.tsx, PaymentPinDialog.tsx, securityApi.ts
 │   │   ├── api.ts, socialApi.ts, splitApi.ts, commerceApi.ts
 │   │   ├── qrPayload.ts, qrMedia.ts, moneyInput.ts, splitMath.ts
 │   │   └── *.test.ts, *.test.tsx, App.css, index.css, assets/
@@ -254,6 +283,7 @@ PayFlow/
 │   ├── qa/                         # Isolated backend and browser harnesses
 │   ├── package.json, package-lock.json
 │   └── .env.example
+├── docs/SECURITY.md
 └── README.md
 ```
 
@@ -342,6 +372,13 @@ The frontend defaults to `http://localhost:8001`. No credentials belong in its e
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | Backend | No | Access-token lifetime, integer 1–60; default `15` |
 | `PAYFLOW_DEMO_MOBILE_PREFIXES` | Backend | No | One to ten ASCII digits allowed as the first digit of a ten-digit demo mobile number; default `6789` |
 | `VITE_API_BASE_URL` | `frontend/.env` or frontend process environment | No | Public backend URL; default `http://localhost:8001` |
+| `PAYMENT_SINGLE_LIMIT`, `PAYMENT_DAILY_LIMIT`, `PAYMENT_DAILY_COUNT` | Backend | No | Exact decimal amounts `100000.00` / `200000.00`, daily count `50` |
+| `REQUEST_DAILY_COUNT` | Backend | No | UTC-day request/contribution creation cap; default `20` |
+| `PIN_MAX_ATTEMPTS`, `PIN_LOCK_SECONDS`, `PAYMENT_AUTH_SECONDS` | Backend | No | Defaults `5`, `900`, `120`; grant TTL is bounded to 300 seconds |
+| `LOGIN_IP_LIMIT`, `LOGIN_IDENTITY_LIMIT`, `REGISTER_IP_LIMIT` | Backend | No | Defaults `30` per minute/IP, `10` per 15 minutes/identity, `10` per hour/IP |
+| `PIN_RATE_LIMIT`, `PAYMENT_RATE_LIMIT` | Backend | No | Defaults `10` PIN calls and `30` new submissions per user/minute |
+| `RISK_*` | Backend | No | Exact rule settings/defaults are enumerated in `.env.example` and [SECURITY.md](docs/SECURITY.md) |
+| `SECURITY_RETENTION_DAYS` | Backend | No | Recent event visibility/operator retention cutoff; default `90`, no scheduled purge |
 | `REGISTER_TEST_POSTGRES` | Backend test process only | No | Set to `1` for PostgreSQL integration tests; leave unset for the limited SQLite suite |
 
 Safe templates exist at [backend/.env.example](backend/.env.example) and [frontend/.env.example](frontend/.env.example). Local environment files are ignored by Git. Backend configuration reads its adjacent `.env`; frontend `VITE_` values become public build configuration. Restart the relevant server after changes and rebuild the frontend for changed production values.
@@ -358,7 +395,7 @@ Run each block from the repository root in a separate PowerShell terminal.
 docker start payflow-postgres-5436
 Set-Location backend
 .\.venv\Scripts\python.exe -m alembic upgrade head
-.\.venv\Scripts\python.exe -m uvicorn main:app --reload --port 8001
+.\.venv\Scripts\python.exe -m uvicorn main:app --reload --port 8001 --no-proxy-headers
 ```
 
 **Frontend:**
@@ -393,9 +430,9 @@ $env:REGISTER_TEST_POSTGRES = '1'
 Remove-Item Env:REGISTER_TEST_POSTGRES
 ```
 
-Tests cover authorization, exact amounts, ledger balance, injected rollback, idempotent replay/conflicts, concurrent spending/duplicates, request/split lifecycle races, service fulfillment, and migration compatibility.
+Tests cover PIN setup/lockout/change, grant binding/expiry/consumption, UTC counters, limits/risk/rate failures, audit privacy, authorization, exact amounts, ledger balance, rollback injection, retry/concurrency and request/split/service regressions. Security fixtures do not reset the development database.
 
-**Integration-test isolation:** payment tests create fresh schemas in the separate `payflow_phase4_tests` database, with independent sessions and real commits. The PostgreSQL role needs permission to create that database once and create schemas there. Authentication/account regression and migration tests use outer rollback transactions against the configured database; sequences can still advance. Dedicated test schemas are deliberately retained. PostgreSQL tests are therefore not read-only operations even though they preserve development records.
+**Integration-test isolation:** payment tests create fresh schemas in the separate `payflow_phase4_tests` database, with independent sessions and real commits. The PostgreSQL role needs permission to create that database once and create schemas there. Authentication/account and migration tests also use the dedicated test database, with outer rollback transactions and isolated schemas. Dedicated committed test schemas are deliberately retained. Legacy payment regression helpers obtain real PIN grants and explicitly relax configured risk thresholds in their fixture process; dedicated security tests and default browser QA enforce the actual defaults. PostgreSQL tests are therefore not read-only operations even though they preserve development records.
 
 ### Frontend
 
@@ -408,7 +445,7 @@ npm run lint
 npm run build
 ```
 
-Vitest/jsdom tests exercise forms, confirmation, validation, QR handling, retry recovery, receipts, contacts, requests, splits, and purchases with mocked HTTP calls. `npm run build` also runs `tsc -b` before generating the Vite bundle in `frontend/dist`.
+Vitest/jsdom tests exercise PIN setup/entry/lockout, blocked-payment warnings, forms, confirmation, QR handling, retry recovery, receipts, contacts, requests, splits, and purchases with mocked HTTP calls. `npm run build` also runs `tsc -b` before generating the Vite bundle in `frontend/dist`.
 
 ### Schema and ledger checks
 
@@ -418,9 +455,10 @@ From `backend`, with the database already migrated:
 .\.venv\Scripts\python.exe -m alembic current
 .\.venv\Scripts\python.exe -m alembic check
 .\.venv\Scripts\python.exe -m reconcile
+.\.venv\Scripts\python.exe -m security_retention
 ```
 
-`alembic check` compares SQLAlchemy metadata with the schema; integration tests cover trigger behavior. Reconciliation uses a consistent read-only snapshot and exits unsuccessfully when an invariant fails. It never repairs balances or rewrites history.
+`alembic check` compares SQLAlchemy metadata with the schema; integration tests cover trigger behavior. Reconciliation uses a consistent read-only snapshot and exits unsuccessfully when an invariant fails. It never repairs balances or rewrites history. The retention command above only previews eligible security-row counts; it does not prune them.
 
 ### Optional browser verification
 
@@ -428,12 +466,17 @@ From `backend`, with the database already migrated:
 
 Use the isolated backend on `127.0.0.1:18016` and a separate Vite process with `VITE_API_BASE_URL=http://127.0.0.1:18016`. Harnesses block writes outside that backend. Shutdown checks reconcile its ledger and compare development-record snapshots. These scripts create isolated test records and run test-schema migrations; do not point them at ordinary development payment endpoints. Headless checks do not establish physical-camera or assistive-technology compatibility.
 
+The `qa/security-browser.mjs` harness additionally tests PIN lockout/recovery, PIN change, risk/daily blocks, private events and original-key recovery after a lost committed response and re-login. Use a **fresh isolated QA backend only**, with explicit test-process overrides `PIN_LOCK_SECONDS=5`, `PIN_RATE_LIMIT=30`, `PAYMENT_DAILY_LIMIT=25.00`, and `RISK_BLOCK_AMOUNT=20.00`. These overrides do not modify `backend/.env`; restart the QA server to restore defaults.
+
 ## API overview
 
-User-specific routes require a Bearer token. `Idempotency-Key: <UUID>` is required for money-changing requests, creating money requests/splits, and renewing split contributions. Payloads and responses are documented in [FastAPI /docs](http://localhost:8001/docs); this table highlights the main routes.
+User-specific routes require a Bearer token. New sensitive payments additionally require a bound `Payment-Authorization` grant; demo funding retains its controlled exemption. `Idempotency-Key: <UUID>` is required for money-changing requests, creating money requests/splits, and renewing split contributions. Payloads and responses are documented in [FastAPI /docs](http://localhost:8001/docs); this table highlights the main routes.
 
 | Group | Method and route | Purpose |
 | --- | --- | --- |
+| Security | `GET /security/status`, `GET /security/events` | Own PIN/limit status and paginated security activity |
+| Security | `POST /security/pin`, `POST /security/pin/change` | Password-authenticated initial setup and current-PIN-authenticated change; no reset endpoint |
+| Security | `POST /security/payment-authorizations` | Verify PIN and issue a short-lived grant bound to an intended payment/key |
 | Authentication | `POST /register`, `POST /login`, `GET /me` | Create a user, obtain a token, and retrieve the authenticated profile |
 | Accounts | `GET /accounts/banks`, `GET /accounts`, `POST /accounts` | List demo banks and create/list owned accounts |
 | Accounts | `PATCH /accounts/{account_id}/primary` | Change the owned default account atomically |
@@ -474,8 +517,8 @@ QR payloads use `payflow://pay?v=1&upi=recipient-example%40payflow`. Only a publ
 
 Use fictional identities in two browser profiles, Alice and Bob. Manual operations intentionally persist demo records; use the isolated QA environment for disposable experiments.
 
-1. Register and sign in as both users. Create an account for each and copy Bob's generated UPI ID.
-2. Alice adds ₹1,000 of demo funds, verifies Bob, reviews a ₹125.50 transfer, and confirms. Refresh both users' balances/history and open the same receipt.
+1. Register and sign in as both users. Open **Security Settings**, re-enter the account password, and set a strong payment PIN. Create an account for each and copy Bob's generated UPI ID.
+2. Alice adds ₹1,000 of demo funds, verifies Bob, reviews a ₹125.50 transfer, confirms, and enters her payment PIN. Refresh both users' balances/history and open the same receipt.
 3. Bob displays/downloads his QR. Alice scans or uploads it, checks the backend-verified recipient, and explicitly confirms a new payment.
 4. Save Bob as a contact/favorite. Create a money request; as its designated payer, review and pay it or decline it. Creating a request moves no money.
 5. Create an external expense split with an optional creator share and equal/custom allocations. Pay Bob's linked contribution through Requests or My Splits; both represent the same obligation.
@@ -506,10 +549,11 @@ No application screenshots are currently committed. The image under `frontend/sr
 ## Limitations
 
 - Fictional INR only: no real banking/UPI/BBPS integration, telecom activation, utility settlement, refunds, reversals, recurring payments, or multi-currency support.
-- Not a production-ready financial service. No refresh-token/revocation system, MFA, email verification, password recovery, or login-specific throttling. Registration explicitly reports duplicate emails.
+- Not a production-ready financial service. No refresh-token/revocation system, MFA, verified email, password recovery, or independent forgotten-PIN recovery. Both login and registration are rate-limited. Registration explicitly reports duplicate emails.
+- Six-digit PINs have limited entropy; hashing and online lockout do not eliminate offline guessing after database compromise. PIN knowledge is not claimed as independent MFA. Risk rules are demo heuristics and may block legitimate behavior.
 - Localhost HTTP, basic per-user limits, and database triggers do not replace TLS, edge abuse protection, monitoring, or least-privilege database roles. Administrators can alter accounting protections.
 - Fulfillment is synchronous and fictional. Synthetic bill references are stored in plain text. Recharge records retain only masked numbers; unresolved browser intents temporarily retain the original number for exact retry.
-- Deliberately small demo limits: four accounts, three user-wide funding actions, ten split participants, 100 generated bills, and 20 saved billers per user. No automated funding reset or idempotency-record expiry exists.
+- Deliberately small demo limits: four accounts, three user-wide funding actions, ten split participants, 100 generated bills, and 20 saved billers per user. No automated funding reset or idempotency-record expiry exists. Security retention requires an explicit operator action.
 - Retry metadata is tab/session scoped. Clearing it or switching devices loses the frontend recovery context; inspect history before starting a replacement payment.
 - No committed deployment pipeline, Compose configuration, or hosted-demo URL is provided. Browser harnesses do not prove physical-device/camera or screen-reader compatibility.
 

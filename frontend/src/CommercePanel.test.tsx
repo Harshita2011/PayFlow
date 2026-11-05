@@ -1,3 +1,4 @@
+import { approvePin } from './pinTestHelpers'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import CommercePanel from './CommercePanel'
@@ -160,6 +161,7 @@ describe('Fictional bills and recharge', () => {
     await rechargeReview()
     const button = screen.getByRole('button', { name: 'Confirm simulated payment' })
     fireEvent.click(button); fireEvent.click(button)
+    await approvePin()
     await waitFor(() => expect(mock.mock.calls.filter(([url]) => url.endsWith('/recharge')).length).toBe(1))
     expect(JSON.parse(String(mock.mock.calls.find(([url]) => url.endsWith('/recharge'))![1]?.body))).toEqual({ mobile: '9876543210', plan_id: plan.id, source_account_id: 17 })
     resolve(json(receipt, 201))
@@ -171,6 +173,7 @@ describe('Fictional bills and recharge', () => {
     const mock = setup((path) => { if (path === '/recharge') { calls++; return calls === 1 ? Promise.reject(new Error('lost response')) : Promise.resolve(json(receipt, 201)) } return undefined })
     render(<PaymentPanel token="token" accountId={17} sourceAccountId={17} accounts={[account]} senderAccount={account} onLogout={vi.fn()} onBalanceChanged={vi.fn()} view="bills" />)
     await rechargeReview(); fireEvent.click(screen.getByRole('button', { name: 'Confirm simulated payment' }))
+    await approvePin()
     fireEvent.click(await screen.findByRole('button', { name: 'Retry same request' }))
     await screen.findByRole('article', { name: 'Payment receipt' })
     const requests = mock.mock.calls.filter(([url]) => url.endsWith('/recharge'))
@@ -182,6 +185,7 @@ describe('Fictional bills and recharge', () => {
     setup((path) => path === '/recharge' ? Promise.resolve(json({ detail: 'Insufficient simulated funds' }, 400)) : undefined)
     render(<PaymentPanel token="token" accountId={17} sourceAccountId={17} accounts={[account]} senderAccount={account} onLogout={vi.fn()} onBalanceChanged={vi.fn()} view="bills" />)
     await rechargeReview(); fireEvent.click(screen.getByRole('button', { name: 'Confirm simulated payment' }))
+    await approvePin()
     await screen.findByText('Insufficient simulated funds')
     expect(screen.queryByText('Simulated payment completed.')).toBeNull()
   })
@@ -192,6 +196,7 @@ describe('Fictional bills and recharge', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Review bill payment' }))
     expect(mock.mock.calls.some(([url]) => url.endsWith('/bills/bill-id/pay'))).toBe(false)
     fireEvent.click(screen.getByRole('button', { name: 'Confirm simulated payment' }))
+    await approvePin()
     await screen.findByRole('article', { name: 'Payment receipt' })
     expect(JSON.parse(String(mock.mock.calls.find(([url]) => url.endsWith('/bills/bill-id/pay'))![1]?.body))).toEqual({ source_account_id: 17 })
   })

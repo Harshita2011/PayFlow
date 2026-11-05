@@ -153,13 +153,13 @@ export function setPrimaryAccount(token: string, id: number) {
   return apiRequest<BankAccount>(`/accounts/${id}/primary`, { method: 'PATCH', headers: { Authorization: `Bearer ${token}` } })
 }
 
-export function selfTransfer(token: string, key: string, payload: SelfTransferInput) {
-  return apiRequest<PaymentReceipt>('/payments/self-transfer', { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Idempotency-Key': key }, body: JSON.stringify(payload) })
+export function selfTransfer(token: string, key: string, payload: SelfTransferInput, grant?: string) {
+  return apiRequest<PaymentReceipt>('/payments/self-transfer', { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Idempotency-Key': key, ...(grant ? { 'Payment-Authorization': grant } : {}) }, body: JSON.stringify(payload) })
 }
 
-export function transferMoney(token: string, key: string, payload: TransferInput) {
+export function transferMoney(token: string, key: string, payload: TransferInput, grant?: string) {
   return apiRequest<PaymentReceipt>('/payments/transfer', {
-    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Idempotency-Key': key }, body: JSON.stringify(payload),
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Idempotency-Key': key, ...(grant ? { 'Payment-Authorization': grant } : {}) }, body: JSON.stringify(payload),
   })
 }
 

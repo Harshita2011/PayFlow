@@ -42,7 +42,17 @@ def reconcile(connection):
         OR (p.type='BILL_PAYMENT' AND (SELECT count(*) FROM utility_bills b WHERE b.payment_id=p.id AND b.user_id=p.actor_user_id AND b.status='PAID' AND b.amount_due=p.amount)<>1))
         UNION SELECT r.id FROM mobile_recharges r LEFT JOIN payments p ON p.id=r.payment_id WHERE p.id IS NULL OR p.type<>'MOBILE_RECHARGE' OR p.status<>'SUCCESS' OR p.actor_user_id<>r.user_id
         UNION SELECT b.id FROM utility_bills b LEFT JOIN payments p ON p.id=b.payment_id WHERE b.status='PAID' AND (p.id IS NULL OR p.type<>'BILL_PAYMENT' OR p.status<>'SUCCESS' OR p.actor_user_id<>b.user_id OR p.amount<>b.amount_due)""")).scalars().all()
-    return {"invalid_service_links": service_invalid, "balanced": net == 0, "account_mismatches": mismatches, "invalid_postings": invalid,
+    security_invalid = connection.execute(text("""SELECT a.idempotency_key FROM payment_authorizations a
+        LEFT JOIN payments p ON p.id=a.payment_id LEFT JOIN payment_requests r ON r.payment_id=p.id
+        WHERE a.consumed_at IS NOT NULL AND (p.id IS NULL OR p.status<>'SUCCESS' OR p.type='DEMO_FUNDING'
+          OR p.actor_user_id<>a.user_id OR p.sender_account_id<>a.source_account_id OR p.amount<>a.amount
+          OR a.consumed_at>=a.expires_at OR r.key IS DISTINCT FROM a.idempotency_key OR r.fingerprint IS DISTINCT FROM a.fingerprint)
+        UNION SELECT c.user_id::text FROM payment_limit_counters c WHERE c.amount<>
+          (SELECT coalesce(sum(p.amount),0) FROM payments p WHERE p.actor_user_id=c.user_id AND p.status='SUCCESS'
+            AND p.type<>'DEMO_FUNDING' AND (p.created_at AT TIME ZONE 'UTC')::date=c.utc_day)
+          OR c.transaction_count<>(SELECT count(*) FROM payments p WHERE p.actor_user_id=c.user_id AND p.status='SUCCESS'
+            AND p.type<>'DEMO_FUNDING' AND (p.created_at AT TIME ZONE 'UTC')::date=c.utc_day)""")).scalars().all()
+    return {"invalid_security_links": security_invalid, "invalid_service_links": service_invalid, "balanced": net == 0, "account_mismatches": mismatches, "invalid_postings": invalid,
         "invalid_self_transfers": self_invalid, "invalid_request_links": request_invalid,
         "invalid_splits": split_invalid, "invalid_primary_accounts": primary_invalid}
 

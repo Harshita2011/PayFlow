@@ -27,6 +27,14 @@ class RegisterRequest(LoginRequest):
     password: SecretStr = Field(min_length=8, max_length=128)
 
 
+    @field_validator("password")
+    @classmethod
+    def reject_common_password(cls, value):
+        if value.get_secret_value().lower() in {"password", "password123", "12345678", "123456789", "qwerty123", "letmein123", "abcdefgh"}:
+            raise ValueError("Choose a less predictable account password")
+        return value
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: Literal["bearer"] = "bearer"

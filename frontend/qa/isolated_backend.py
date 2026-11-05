@@ -35,10 +35,12 @@ if __name__ == "__main__":
     original = snapshot()
     PaymentDatabaseTestCase.setUpClass()
     fixture = PaymentDatabaseTestCase()
+    fixture.auto_authorize = False
+    fixture.relax_security_limits = False
     fixture.setUp()
     print(f"Browser QA uses payflow_phase4_tests / {fixture.schema}", flush=True)
     try:
-        uvicorn.run(app, host="127.0.0.1", port=18016)
+        uvicorn.run(app, host="127.0.0.1", port=18016, proxy_headers=False)
     finally:
         fixture.assert_reconciled()
         fixture.tearDown()

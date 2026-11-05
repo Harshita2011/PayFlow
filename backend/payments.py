@@ -69,6 +69,9 @@ def charge_lookup(db, user_id, cost=1):
         ON CONFLICT (user_id) DO UPDATE SET window_start=EXCLUDED.window_start,
         attempts=CASE WHEN recipient_lookup_limits.window_start=EXCLUDED.window_start
           THEN LEAST(recipient_lookup_limits.attempts+:cost,11) ELSE :cost END RETURNING attempts"""), {"uid": user_id, "cost": cost}).scalar_one()
+    if attempts > 10:
+        from security_events import audit
+        audit(db, "RATE_LIMIT_EXCEEDED", user_id, bucket="recipient-lookup")
     # Count misses as well as hits, across API workers. This is not a money-changing request.
     db.commit()
     if attempts > 10:
@@ -91,7 +94,7 @@ def post_ledger(db: Session, payment: Payment):
     db.flush()
 
 
-def execute_payment(db: Session, user: User, key: str, kind: str, payload: PaymentInput, *, money_request_id: str | None = None, bill_id: str | None = None):
+def execute_payment(db: Session, user: User, key: str, kind: str, payload: PaymentInput, *, money_request_id: str | None = None, bill_id: str | None = None, authorization_token: str | None = None):
     fingerprint = request_fingerprint(kind, payload)
     if money_request_id:
         fingerprint = hashlib.sha256(f"collect:{money_request_id}:{fingerprint}".encode()).hexdigest()
@@ -99,6 +102,10 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Payme
         fingerprint = hashlib.sha256(f"bill:{bill_id}:{fingerprint}".encode()).hexdigest()
     merchant = kind in {"MOBILE_RECHARGE", "BILL_PAYMENT"}
     user_id = user.id
+    from security_events import PolicyError, enforce_rate, audit, clock
+    from security_settings import settings
+    from payment_policy import authorize_posting, record_decision, record_denial
+    rate_attempted = False
     try:
         # ON CONFLICT waits for a concurrent request with the same scoped key.
         db.execute(text("SET LOCAL lock_timeout = '5s'"))
@@ -113,12 +120,20 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Payme
             db.rollback()
             return JSONResponse(status_code=status, content=body)
 
+        # Only the winner of the retry-key reservation is a new submission. A
+        # concurrent duplicate waits for that result without using another slot.
+        rate_attempted = True
+        enforce_rate(db, "payment-submit", str(user_id), settings.submit_per_minute, 60, user_id, commit=False)
+
         def finish_collect(status, body):
             # Completes the same scoped reservation even for lifecycle conflicts/replays.
+            if status == 404 and body.get("detail") == "Account not found":
+                audit(db, "UNAUTHORIZED_ACCOUNT_ACCESS", user_id, key, code="ACCOUNT_UNAVAILABLE")
             request.http_status, request.response_body = status, body
             db.flush()
             db.commit()
-            return JSONResponse(status_code=status, content=body)
+            return JSONResponse(status_code=status, content=body,
+                headers={"Retry-After": "60"} if status == 429 and body.get("detail", "").startswith("Too many simulated purchases") else None)
 
         purchase = None
         if merchant:
@@ -205,7 +220,15 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Payme
         if target and target.balance + amount > Decimal("9999999999999999.99"):
             reason = "Recipient balance limit reached"
 
+        grant, usage, risk_level, risk_rules = None, None, "LOW", []
+        posting_time = clock(db)
+        valid_participants = merchant or (target is not None and (kind == "DEMO_FUNDING" or
+            (kind == "SELF_TRANSFER" and target.id != sender.id) or (kind == "TRANSFER" and target.user_id != user_id)))
+        if valid_participants:
+            grant, usage, risk_level, risk_rules, posting_time = authorize_posting(db, user_id, key, fingerprint,
+                kind, payload, sender, target, amount, authorization_token, money_request_id=money_request_id, bill_id=bill_id)
         payment = Payment(
+            created_at=posting_time,
             actor_user_id=user_id, sender_account_id=sender.id if kind != "DEMO_FUNDING" else None,
             recipient_account_id=target.id if target else None, amount=amount, currency="INR",
             type=kind, status="FAILED" if reason else "SUCCESS",
@@ -228,6 +251,13 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Payme
             if target is not None:
                 target.balance += amount
             post_ledger(db, payment)
+            if grant:
+                consumed_at = clock(db)
+                if consumed_at >= grant.expires_at:
+                    raise PolicyError(403, "AUTHORIZATION_EXPIRED", "Payment authorization expired. Confirm your PIN again.")
+                grant.consumed_at, grant.payment_id = consumed_at, payment.id
+                usage.amount += amount
+                usage.transaction_count += 1
             if merchant:
                 from commerce_service import fulfill_purchase
                 fulfill_purchase(db, user_id, payment, payload, purchase)
@@ -236,6 +266,10 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Payme
                 collect.status, collect.payment_id, collect.updated_at = "PAID", payment.id, posted_at
         if collect and not reason:
             settle_if_paid(db, split)
+        if valid_participants:
+            record_decision(db, user_id, key, "REQUEST" if collect else kind, risk_level, risk_rules, payment.id)
+        audit(db, "PAYMENT_FAILED" if reason else "PAYMENT_SUCCESS", user_id, key,
+            "DENIED" if reason else "SUCCESS", operation=kind)
         public = receipt(payment, sender.id).model_dump(mode="json")
         request.payment_id = payment.id
         request.http_status = error_status if reason else 201
@@ -246,9 +280,30 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Payme
         db.execute(text("SET CONSTRAINTS ALL DEFERRED"))
         db.commit()
         return JSONResponse(status_code=request.http_status, content=request.response_body)
+    except PolicyError as error:
+        db.rollback()
+        try:
+            record_denial(db, user_id, key, kind, error, charge_submission=rate_attempted)
+        except Exception:
+            db.rollback()
+            return JSONResponse(status_code=503, content={"detail": "Security state unavailable. Retry with the same idempotency key."})
+        return JSONResponse(status_code=error.status, content={"detail": error.message, "code": error.code, "rules": error.rules},
+            headers={"Retry-After": str(error.retry_after)} if error.retry_after else None)
     except Exception:
         # Includes deadlocks, serialization errors, injected failures, and uncertain commit failures.
         db.rollback()
+        try:
+            # Best effort after rollback. A committed-but-unacknowledged request
+            # already charged its slot; never charge it a second time.
+            if rate_attempted and db.get(PaymentRequest, (user_id, key)) is None:
+                try:
+                    enforce_rate(db, "payment-submit", str(user_id), settings.submit_per_minute, 60, user_id, commit=False)
+                except PolicyError:
+                    pass
+            audit(db, "PAYMENT_OUTCOME_UNKNOWN", user_id, key, "UNKNOWN", operation=kind)
+            db.commit()
+        except Exception:
+            db.rollback()
         return JSONResponse(status_code=503, content={"detail": "Payment outcome could not be confirmed. Retry with the same idempotency key"})
 
 
@@ -258,13 +313,13 @@ def fund(payload: DemoFundingRequest, idempotency_key: UUID = Header(), user: Us
 
 
 @router.post("/payments/transfer", response_model=PaymentReceipt, status_code=201)
-def transfer(payload: TransferRequest, idempotency_key: UUID = Header(), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    return execute_payment(db, user, str(idempotency_key), "TRANSFER", payload)
+def transfer(payload: TransferRequest, idempotency_key: UUID = Header(), payment_authorization: str | None = Header(default=None, max_length=128), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return execute_payment(db, user, str(idempotency_key), "TRANSFER", payload, authorization_token=payment_authorization)
 
 
 @router.post("/payments/self-transfer", response_model=PaymentReceipt, status_code=201)
-def self_transfer(payload: SelfTransferRequest, idempotency_key: UUID = Header(), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    return execute_payment(db, user, str(idempotency_key), "SELF_TRANSFER", payload)
+def self_transfer(payload: SelfTransferRequest, idempotency_key: UUID = Header(), payment_authorization: str | None = Header(default=None, max_length=128), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    return execute_payment(db, user, str(idempotency_key), "SELF_TRANSFER", payload, authorization_token=payment_authorization)
 
 
 def visible_to(account_ids):
