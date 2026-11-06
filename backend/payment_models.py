@@ -36,6 +36,7 @@ class Payment(Base):
         CheckConstraint("settlement_ledger_account_id IS NULL OR (type='MOBILE_RECHARGE' AND settlement_ledger_account_id='settlement-recharge') OR (type='BILL_PAYMENT' AND settlement_ledger_account_id='settlement-bills')", name="ck_payment_settlement"),
         Index("ix_payments_sender_history", "sender_account_id", "created_at", "id"),
         Index("ix_payments_recipient_history", "recipient_account_id", "created_at", "id"),
+        Index("ix_payments_actor_time", "actor_user_id", "created_at"),
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     actor_user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)

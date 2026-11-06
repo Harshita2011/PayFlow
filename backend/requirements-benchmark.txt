@@ -1,0 +1,3 @@
+# Optional load generator only; not an application runtime dependency.
+-r requirements-dev.txt
+locust>=2.40,<3

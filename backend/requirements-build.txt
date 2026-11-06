@@ -1,0 +1,2 @@
+# Patched installer used by image builds and CI; not a payment-service dependency.
+pip>=26.2.2,<27

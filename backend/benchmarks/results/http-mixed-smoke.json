@@ -1,0 +1,123 @@
+{
+  "new_commit_responses": 40,
+  "financial_failures": 0,
+  "idempotent_replays": 0,
+  "uncertain": 0,
+  "committed": 40,
+  "failed": 0,
+  "outbox": {
+    "PROCESSED": 73,
+    "PENDING": 3
+  },
+  "deadlocks": 0,
+  "connections": 6,
+  "lock_waiters": 0,
+  "seconds": 7.164,
+  "committed_tps": 5.583,
+  "http_requests": 150,
+  "http_failures": 0,
+  "http_rps": 20.938,
+  "http_p50_ms": 120,
+  "http_p95_ms": 280,
+  "http_p99_ms": 480,
+  "http_routes": [
+    {
+      "name": "/accounts",
+      "method": "GET",
+      "requests": 26,
+      "failures": 0
+    },
+    {
+      "name": "/payments/history",
+      "method": "GET",
+      "requests": 18,
+      "failures": 0
+    },
+    {
+      "name": "/bills/lookup",
+      "method": "POST",
+      "requests": 6,
+      "failures": 0
+    },
+    {
+      "name": "/login",
+      "method": "POST",
+      "requests": 5,
+      "failures": 0
+    },
+    {
+      "name": "/splits",
+      "method": "POST",
+      "requests": 6,
+      "failures": 0
+    },
+    {
+      "name": "/security/payment-authorizations",
+      "method": "POST",
+      "requests": 40,
+      "failures": 0
+    },
+    {
+      "name": "/payments/intent/TRANSFER",
+      "method": "POST",
+      "requests": 11,
+      "failures": 0
+    },
+    {
+      "name": "/payments/intent/BILL_PAYMENT",
+      "method": "POST",
+      "requests": 6,
+      "failures": 0
+    },
+    {
+      "name": "/payments/intent/REQUEST",
+      "method": "POST",
+      "requests": 11,
+      "failures": 0
+    },
+    {
+      "name": "/payments/resolve",
+      "method": "POST",
+      "requests": 4,
+      "failures": 0
+    },
+    {
+      "name": "/payments/intent/SELF_TRANSFER",
+      "method": "POST",
+      "requests": 11,
+      "failures": 0
+    },
+    {
+      "name": "/payment-requests",
+      "method": "POST",
+      "requests": 5,
+      "failures": 0
+    },
+    {
+      "name": "/payments/intent/MOBILE_RECHARGE",
+      "method": "POST",
+      "requests": 1,
+      "failures": 0
+    }
+  ],
+  "committed_intent_p50_ms": 280.99,
+  "committed_intent_p95_ms": 442.36,
+  "committed_intent_p99_ms": 749.68,
+  "intent_latency_samples": 40,
+  "users": 12,
+  "source_accounts": 12,
+  "api_workers": 1,
+  "security_overrides": false,
+  "mode": "mixed",
+  "target_financial_tps": "10",
+  "api_fixture_pool_size": 5,
+  "api_fixture_max_overflow": 10,
+  "worker_pool_size": 2,
+  "worker_max_overflow": 0,
+  "hardware_cpu": "AMD Ryzen 7 6800HS Creator Edition",
+  "hardware_logical_processors": 16,
+  "host_ram_gib": 13.7,
+  "postgres_memory_budget_gib": 6.621,
+  "load_generator_on_api_host": true,
+  "owned_accounts": 24
+}

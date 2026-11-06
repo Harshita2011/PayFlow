@@ -1,0 +1,149 @@
+name: Validate PayFlow
+on:
+  push:
+    branches: [main, master, 'codex/**']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: validate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+defaults:
+  run:
+    shell: bash
+jobs:
+  backend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16-bookworm@sha256:5264710be20f409750ac6dc4e5706dcef929c87e241605463f0f9aefa932a8d9
+        env:
+          POSTGRES_DB: payflow_ci_anchor
+          POSTGRES_USER: ci_owner
+          POSTGRES_PASSWORD: ephemeral-ci-only-password
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U ci_owner -d payflow_ci_anchor"
+          --health-interval 5s --health-timeout 3s --health-retries 15
+    env:
+      PAYFLOW_ENV: test
+      DATABASE_URL: postgresql+psycopg://ci_owner:ephemeral-ci-only-password@127.0.0.1:5432/payflow_ci_anchor
+      PAYFLOW_TEST_DATABASE: payflow_ci_tests
+      PAYFLOW_TEST_DATABASE_URL: postgresql+psycopg://ci_test:ephemeral-ci-only-password@127.0.0.1:5432/payflow_ci_tests
+      REGISTER_TEST_POSTGRES: '1'
+      LOG_LEVEL: ERROR
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with: {python-version: '3.11', cache: pip, cache-dependency-path: backend/requirements-dev.lock}
+      - run: python -m pip install --require-hashes -r backend/requirements-build.lock -r backend/requirements-dev.lock
+      - name: Generate ephemeral JWT and provision test-only credentials
+        run: python tools/ci_database.py
+      - name: Migrate isolated anchor
+        working-directory: backend
+        run: python -m migrate --apply --expected-current base
+      - name: Full PostgreSQL suite
+        working-directory: backend
+        run: python -B -m unittest discover -s tests -v
+      - name: Schema and ledger checks
+        working-directory: backend
+        run: |
+          python -m migrate
+          python -m reconcile
+          python -m pip check
+  frontend:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run: {working-directory: frontend}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with: {persist-credentials: false}
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
+        with: {node-version: '22', cache: npm, cache-dependency-path: frontend/package-lock.json}
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: npm run lint
+  security:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+        with: {python-version: '3.11', cache: pip, cache-dependency-path: backend/requirements-ci.lock}
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f
+        with: {node-version: '22', cache: npm, cache-dependency-path: frontend/package-lock.json}
+      - run: python -m pip install --require-hashes -r backend/requirements-ci.lock
+      - run: python -m pip_audit --require-hashes -r backend/requirements.lock
+      - run: python -m pip_audit --require-hashes -r backend/requirements-build.lock
+      - run: python -m pip_audit --require-hashes -r backend/requirements-ci.lock
+      - run: python tools/static_analysis.py
+      - run: python tools/secret_scan.py
+      - run: python tools/validate_ci.py
+      - run: python tools/validate_deployment.py
+      - run: npm ci --prefix frontend
+      - run: npm audit --prefix frontend --audit-level=moderate
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-bookworm@sha256:5264710be20f409750ac6dc4e5706dcef929c87e241605463f0f9aefa932a8d9
+        env: {POSTGRES_DB: payflow_ci_anchor, POSTGRES_USER: ci_owner, POSTGRES_PASSWORD: ephemeral-ci-only-password}
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U ci_owner -d payflow_ci_anchor"
+          --health-interval 5s --health-timeout 3s --health-retries 15
+    env:
+      PAYFLOW_ENV: test
+      DATABASE_URL: postgresql+psycopg://ci_owner:ephemeral-ci-only-password@127.0.0.1:5432/payflow_ci_anchor
+      PAYFLOW_TEST_DATABASE: payflow_ci_tests
+      PAYFLOW_TEST_DATABASE_URL: postgresql+psycopg://ci_test:ephemeral-ci-only-password@127.0.0.1:5432/payflow_ci_tests
+      PAYFLOW_PYTHON: python
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+        with: {python-version: '3.11', cache: pip, cache-dependency-path: backend/requirements-dev.lock}
+      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f
+        with: {node-version: '22', cache: npm, cache-dependency-path: frontend/package-lock.json}
+      - run: python -m pip install --require-hashes -r backend/requirements-dev.lock
+      - run: python tools/ci_database.py
+      - run: python -m migrate --apply --expected-current base
+        working-directory: backend
+      - run: npm ci
+        working-directory: frontend
+      - run: npx playwright install --with-deps chromium
+        working-directory: frontend
+      - run: npm run test:e2e
+        working-directory: frontend
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: failure()
+        with:
+          name: redacted-e2e-diagnostics
+          path: |
+            test-artifacts/e2e/**/*.png
+            test-artifacts/e2e/**/redacted-trace.json
+          retention-days: 3
+  containers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with: {persist-credentials: false}
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+        with: {python-version: '3.11'}
+      - run: python tools/init_compose.py
+      - run: docker compose --env-file .env.compose config --quiet
+      - run: docker compose --env-file .env.compose up -d --build --wait
+      - run: python tools/deployment_smoke.py
+      - run: docker compose --env-file .env.compose stop worker
+      - run: python tools/compose_backup.py exercise --output backups/ci.dump
+      - name: Stop only this job's project; retain its data for the job lifetime
+        if: always()
+        run: docker compose --env-file .env.compose stop

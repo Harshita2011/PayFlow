@@ -24,6 +24,10 @@ def day_boundary(now):
 def daily_usage(db, user_id, now):
     # Caller holds the same owner-config lock as all payments and primary changes.
     start = day_boundary(now)
+    existing = db.scalar(select(PaymentLimitCounter).where(PaymentLimitCounter.user_id == user_id,
+        PaymentLimitCounter.utc_day == start.date()).with_for_update())
+    if existing is not None:
+        return existing
     amount, count = db.execute(select(func.coalesce(func.sum(Payment.amount), 0), func.count()).where(
         Payment.actor_user_id == user_id, Payment.status == "SUCCESS", Payment.type != "DEMO_FUNDING", Payment.created_at >= start)).one()
     db.execute(insert(PaymentLimitCounter).values(user_id=user_id, utc_day=start.date(), amount=amount,
@@ -34,21 +38,25 @@ def daily_usage(db, user_id, now):
 
 def assess_risk(db, user_id, kind, amount, target, now):
     recent = (Payment.actor_user_id == user_id, Payment.type != "DEMO_FUNDING", Payment.created_at >= now - timedelta(minutes=10))
-    successes = list(db.scalars(select(Payment).where(*recent, Payment.status == "SUCCESS")))
+    velocity, destinations, repeated, services = db.execute(select(
+        func.count().filter(Payment.created_at >= now-timedelta(minutes=1)),
+        func.count(func.distinct(Payment.recipient_account_id)).filter(Payment.type=='TRANSFER'),
+        func.count().filter(Payment.recipient_account_id==(target.id if target else -1)),
+        func.count().filter(Payment.type.in_(['MOBILE_RECHARGE','BILL_PAYMENT']))
+    ).where(*recent,Payment.status=='SUCCESS')).one()
     rules, high = [], False
-    if sum(p.created_at >= now - timedelta(minutes=1) for p in successes) >= settings.risk_velocity:
+    if velocity >= settings.risk_velocity:
         rules.append("PAYMENT_VELOCITY"); high = True
     if amount >= settings.risk_large:
         rules.append("LARGE_PAYMENT"); high = True
     elif amount >= settings.risk_medium:
         rules.append("ELEVATED_AMOUNT")
-    destinations = {p.recipient_account_id for p in successes if p.type == "TRANSFER"}
-    if kind == "TRANSFER" and target and target.id not in destinations and len(destinations) >= settings.risk_distinct:
+    if kind == "TRANSFER" and target and repeated == 0 and destinations >= settings.risk_distinct:
         rules.append("MANY_RECIPIENTS"); high = True
     insufficient = db.scalar(select(func.count()).select_from(Payment).where(*recent, Payment.failure_reason == "Insufficient simulated funds"))
     if insufficient >= settings.risk_insufficient:
         rules.append("REPEATED_INSUFFICIENT_FUNDS"); high = True
-    if kind in {"MOBILE_RECHARGE", "BILL_PAYMENT"} and sum(p.type in {"MOBILE_RECHARGE", "BILL_PAYMENT"} for p in successes) >= settings.risk_services:
+    if kind in {"MOBILE_RECHARGE", "BILL_PAYMENT"} and services >= settings.risk_services:
         rules.append("SERVICE_VELOCITY"); high = True
     pin_failures = db.scalar(select(func.count()).select_from(SecurityAuditEvent).where(SecurityAuditEvent.actor_user_id == user_id,
         SecurityAuditEvent.event_type == "PIN_VERIFICATION_FAILURE", SecurityAuditEvent.created_at >= now - timedelta(minutes=10)))
@@ -57,7 +65,7 @@ def assess_risk(db, user_id, kind, amount, target, now):
     if kind == "TRANSFER" and target:
         fresh = db.scalar(select(Contact.id).where(Contact.owner_user_id == user_id, Contact.contact_user_id == target.user_id,
             Contact.created_at >= now - timedelta(days=1)))
-        if fresh and sum(p.recipient_account_id == target.id for p in successes) >= settings.risk_new_contact:
+        if fresh and repeated >= settings.risk_new_contact:
             rules.append("REPEATED_NEW_CONTACT_PAYMENTS")
     return "HIGH" if high else "MEDIUM" if rules else "LOW", rules
 

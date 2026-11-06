@@ -1,0 +1,5 @@
+-r requirements-dev.txt
+pip-audit>=2.9,<3
+bandit>=1.8,<2
+PyYAML>=6,<7
+pip>=26.2.2,<27

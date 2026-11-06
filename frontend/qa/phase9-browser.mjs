@@ -1,3 +1,4 @@
+import { launchBrowser, UI_URL } from './browser-support.mjs'
 import { configurePin, approvePayment } from './security-helpers.mjs'
 // Real UI with isolated_backend.py. All non-test writes are blocked.
 import { createRequire } from 'node:module'
@@ -9,7 +10,7 @@ const require = createRequire(import.meta.url)
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright')
 const output = path.resolve(process.env.PAYFLOW_SCREENSHOTS || './qa-output')
 await mkdir(output, { recursive: true })
-const browser = await chromium.launch({ headless: true })
+const browser = await launchBrowser(chromium)
 const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } })
 const page = await context.newPage()
 const errors = []
@@ -41,7 +42,7 @@ await page.route('**/*', async (route) => {
   await route.continue()
 })
 try {
-  await page.goto('http://127.0.0.1:5173')
+  await page.goto(UI_URL)
   await page.getByRole('button', { name: 'Create account', exact: true }).click()
   await page.getByLabel('Full name', { exact: true }).fill('Services Learner')
   await page.getByLabel('Email address', { exact: true }).fill(`services-${Date.now()}@example.com`)

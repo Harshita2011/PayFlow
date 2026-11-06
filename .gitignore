@@ -1,6 +1,13 @@
 .env
 .env.*
 !.env.example
+!.env.*.example
+backups/
+test-artifacts/
+playwright-report/
+test-results/
+.tools/
+.verification*
 .venv/
 __pycache__/
 *.py[cod]

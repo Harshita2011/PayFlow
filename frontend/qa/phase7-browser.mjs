@@ -1,3 +1,4 @@
+import { launchBrowser, UI_URL } from './browser-support.mjs'
 import { configurePin, approvePayment } from './security-helpers.mjs'
 // Run only with qa/isolated_backend.py and test Vite pointing at :18016.
 import { createRequire } from 'node:module'
@@ -10,7 +11,7 @@ const require = createRequire(import.meta.url)
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright')
 const output = path.resolve(process.env.PAYFLOW_SCREENSHOTS || './qa-output')
 await mkdir(output, { recursive: true })
-const browser = await chromium.launch({ headless: true })
+const browser = await launchBrowser(chromium)
 const errors = []
 const password = 'Phase7-Learning-Only!'
 const nav = (page, label) => page.getByRole('navigation').getByRole('button', { name: label, exact: true }).click()
@@ -26,7 +27,7 @@ async function createUser(page, name) {
     }
     await route.continue()
   })
-  await page.goto('http://127.0.0.1:5173')
+  await page.goto(UI_URL)
   await page.getByRole('button', { name: 'Create account', exact: true }).click()
   await page.getByLabel('Full name', { exact: true }).fill(name)
   await page.getByLabel('Email address').fill(`${name.toLowerCase().replaceAll(' ', '-')}-${Date.now()}@example.com`)

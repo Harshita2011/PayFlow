@@ -1,0 +1,62 @@
+# PREPARATION ONLY. Applying this blueprint creates billable services; obtain approval first.
+# Provision a persistent managed PostgreSQL database separately; never use a 30-day free DB for retained demo data.
+services:
+  - type: web
+    name: payflow-demo-api
+    runtime: docker
+    plan: '1c-2g'
+    region: singapore
+    autoDeployTrigger: 'off'
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    dockerCommand: python -m serve
+    # Verification only. Owner-credential upgrades are an explicit separate operator step.
+    preDeployCommand: python -m migrate
+    healthCheckPath: /health/ready
+    maxShutdownDelaySeconds: 40
+    envVars:
+      - fromGroup: payflow-demo-common
+      - key: DATABASE_URL
+        sync: false
+      - key: WEB_CONCURRENCY
+        value: '1'
+      - key: JWT_SECRET_KEY
+        sync: false
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+      - key: PAYFLOW_MAX_CONCURRENCY
+        value: '16'
+  - type: worker
+    name: payflow-demo-worker
+    runtime: docker
+    plan: '0.5c-512mb'
+    region: singapore
+    autoDeployTrigger: 'off'
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    dockerCommand: python -m outbox_worker
+    maxShutdownDelaySeconds: 40
+    envVars:
+      - fromGroup: payflow-demo-common
+      - key: DATABASE_URL
+        sync: false
+      - key: WORKER_HEARTBEAT_FILE
+        value: /tmp/payflow-worker-heartbeat
+      # Configuration import requires a key; this independent value never signs API sessions.
+      - key: JWT_SECRET_KEY
+        generateValue: true
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+envVarGroups:
+  - name: payflow-demo-common
+    envVars:
+      - key: PAYFLOW_ENV
+        value: demo
+      - key: PAYFLOW_EXPOSE_DOCS
+        value: '0'
+      - key: LOG_LEVEL
+        value: INFO
+      - key: DB_POOL_SIZE
+        value: '3'
+      - key: DB_MAX_OVERFLOW
+        value: '2'

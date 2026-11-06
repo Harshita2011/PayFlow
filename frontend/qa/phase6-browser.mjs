@@ -1,3 +1,4 @@
+import { launchBrowser, UI_URL } from './browser-support.mjs'
 import { configurePin, approvePayment } from './security-helpers.mjs'
 // Optional browser harness. Requires Playwright externally; never targets the development API.
 import { createRequire } from 'node:module'
@@ -11,7 +12,7 @@ const require = createRequire(import.meta.url)
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright')
 const output = path.resolve(process.env.PAYFLOW_SCREENSHOTS || './qa-output')
 await mkdir(output, { recursive: true })
-const browser = await chromium.launch({ headless: true })
+const browser = await launchBrowser(chromium)
 const errors = []
 const password = 'Learning-Phase6-Only!'
 const nav = (page, name) => page.getByRole('navigation', { name: 'Main navigation' }).getByRole('button', { name, exact: true }).click()
@@ -33,7 +34,7 @@ async function createUser(page, name, bank) {
     }
     await route.continue()
   })
-  await page.goto('http://127.0.0.1:5173')
+  await page.goto(UI_URL)
   await page.getByRole('button', { name: 'Create account', exact: true }).click()
   await page.getByLabel('Full name', { exact: true }).fill(name)
   await page.getByLabel('Email address', { exact: true }).fill(`${name.toLowerCase().replaceAll(' ', '-')}-${Date.now()}@example.com`)

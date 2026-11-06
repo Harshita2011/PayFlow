@@ -18,6 +18,9 @@ from social_models import MoneyRequest
 from accounts import lock_account_config
 from split_service import lock_linked_split, linked_request_is_current, settle_if_paid
 from commerce_schemas import RechargeInput, BillPayInput
+from outbox import enqueue_payment
+from observability import correlation_id, count, log
+from reliability_config import LOCK_MS, STATEMENT_MS
 
 router = APIRouter(tags=["Simulated payments"])
 FUNDING_AMOUNT = Decimal("1000.00")
@@ -108,17 +111,20 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Payme
     rate_attempted = False
     try:
         # ON CONFLICT waits for a concurrent request with the same scoped key.
-        db.execute(text("SET LOCAL lock_timeout = '5s'"))
+        db.execute(text(f"SET LOCAL lock_timeout = '{LOCK_MS}ms'"))
+        db.execute(text(f"SET LOCAL statement_timeout = '{STATEMENT_MS}ms'"))
         reserved = db.scalar(insert(PaymentRequest).values(user_id=user_id, key=key, fingerprint=fingerprint)
             .on_conflict_do_nothing(index_elements=["user_id", "key"]).returning(PaymentRequest.key))
         request = db.scalar(select(PaymentRequest).where(PaymentRequest.user_id == user_id, PaymentRequest.key == key).with_for_update())
         if reserved is None:
             if request.fingerprint != fingerprint:
                 db.rollback()
+                count('idempotency',kind,'CONFLICT')
                 return JSONResponse(status_code=409, content={"detail": "Idempotency key was already used for a different request"})
             body, status = request.response_body, request.http_status
             db.rollback()
-            return JSONResponse(status_code=status, content=body)
+            count('idempotency',kind,'REPLAY')
+            return JSONResponse(status_code=status, content=body, headers={'Idempotency-Replayed':'true'})
 
         # Only the winner of the retry-key reservation is a new submission. A
         # concurrent duplicate waits for that result without using another slot.
@@ -133,7 +139,8 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Payme
             db.flush()
             db.commit()
             return JSONResponse(status_code=status, content=body,
-                headers={"Retry-After": "60"} if status == 429 and body.get("detail", "").startswith("Too many simulated purchases") else None)
+                headers={"Retry-After": "60"} if status == 429 and body.get("detail", "").startswith("Too many simulated purchases") else
+                    {'Idempotency-Replayed':'true'} if body.get('transaction_id') else None)
 
         purchase = None
         if merchant:
@@ -246,6 +253,7 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Payme
         db.add(payment)
         db.flush()
         if not reason:
+            enqueue_payment(db, payment)
             if kind != "DEMO_FUNDING":
                 sender.balance -= amount
             if target is not None:
@@ -279,9 +287,14 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Payme
         db.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
         db.execute(text("SET CONSTRAINTS ALL DEFERRED"))
         db.commit()
-        return JSONResponse(status_code=request.http_status, content=request.response_body)
+        count('payment',kind,'FAILED' if reason else 'SUCCESS')
+        log('payment_result', correlation_id=correlation_id.get(), operation=kind, payment_id=payment.id,
+            outcome='FAILED' if reason else 'SUCCESS')
+        return JSONResponse(status_code=request.http_status, content=request.response_body,
+            headers={'Payment-Posted':'true' if not reason else 'false'})
     except PolicyError as error:
         db.rollback()
+        count('payment',kind,'BLOCKED')
         try:
             record_denial(db, user_id, key, kind, error, charge_submission=rate_attempted)
         except Exception:
@@ -292,6 +305,7 @@ def execute_payment(db: Session, user: User, key: str, kind: str, payload: Payme
     except Exception:
         # Includes deadlocks, serialization errors, injected failures, and uncertain commit failures.
         db.rollback()
+        count('transaction_error',kind,'ERROR')
         try:
             # Best effort after rollback. A committed-but-unacknowledged request
             # already charged its slot; never charge it a second time.

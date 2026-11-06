@@ -1,3 +1,4 @@
+import { launchBrowser, UI_URL } from './browser-support.mjs'
 // Use isolated_backend.py with PIN_LOCK_SECONDS=5, PIN_RATE_LIMIT=30,
 // PAYMENT_DAILY_LIMIT=25.00 and RISK_BLOCK_AMOUNT=20.00. No development writes.
 import { createRequire } from 'node:module'
@@ -11,7 +12,7 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright')
 const output = path.resolve(process.env.PAYFLOW_SCREENSHOTS || './qa-output')
 await mkdir(output, { recursive: true })
 const api = 'http://127.0.0.1:18016'
-const browser = await chromium.launch({ headless: true })
+const browser = await launchBrowser(chromium)
 const a = await (await browser.newContext({ viewport: { width: 1440, height: 1000 } })).newPage()
 const b = await (await browser.newContext({ viewport: { width: 1440, height: 1000 } })).newPage()
 const password = 'Security-QA-Learning-2026!'
@@ -41,7 +42,7 @@ async function user(page, name) {
     await route.continue()
   })
   const email = `${name.toLowerCase().replaceAll(' ','-')}-${Date.now()}@example.com`
-  await page.goto('http://127.0.0.1:5173')
+  await page.goto(UI_URL)
   await page.getByRole('button', { name: 'Create account', exact: true }).click()
   await page.getByLabel('Full name', { exact: true }).fill(name)
   await page.getByLabel('Email address', { exact: true }).fill(email)

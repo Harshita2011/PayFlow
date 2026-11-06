@@ -1,0 +1,12 @@
+.env*
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.log
+.verification*
+tests/
+benchmarks/
+backups/
+test-artifacts/
+.git/

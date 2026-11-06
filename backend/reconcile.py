@@ -52,7 +52,13 @@ def reconcile(connection):
             AND p.type<>'DEMO_FUNDING' AND (p.created_at AT TIME ZONE 'UTC')::date=c.utc_day)
           OR c.transaction_count<>(SELECT count(*) FROM payments p WHERE p.actor_user_id=c.user_id AND p.status='SUCCESS'
             AND p.type<>'DEMO_FUNDING' AND (p.created_at AT TIME ZONE 'UTC')::date=c.utc_day)""")).scalars().all()
-    return {"invalid_security_links": security_invalid, "invalid_service_links": service_invalid, "balanced": net == 0, "account_mismatches": mismatches, "invalid_postings": invalid,
+    event_invalid = connection.execute(text("""SELECT e.event_id FROM outbox_events e LEFT JOIN payments p ON p.id=e.payment_id
+        WHERE p.id IS NULL OR p.status<>'SUCCESS' OR e.event_type<>'payment.posted.v1'
+          OR e.payload::jsonb<>jsonb_build_object('version',1,'payment_id',e.payment_id)
+        UNION SELECT n.id FROM activity_notifications n JOIN outbox_events e ON e.event_id=n.event_id
+        JOIN payments p ON p.id=n.payment_id LEFT JOIN bank_accounts a ON a.id=p.recipient_account_id
+        WHERE e.payment_id<>n.payment_id OR (n.user_id<>p.actor_user_id AND n.user_id IS DISTINCT FROM a.user_id)""")).scalars().all()
+    return {"invalid_event_links": event_invalid, "invalid_security_links": security_invalid, "invalid_service_links": service_invalid, "balanced": net == 0, "account_mismatches": mismatches, "invalid_postings": invalid,
         "invalid_self_transfers": self_invalid, "invalid_request_links": request_invalid,
         "invalid_splits": split_invalid, "invalid_primary_accounts": primary_invalid}
 

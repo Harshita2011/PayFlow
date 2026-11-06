@@ -3,6 +3,7 @@ from pathlib import Path
 from dataclasses import replace
 from unittest.mock import patch
 import re
+import os
 from uuid import uuid4
 import unittest
 
@@ -13,7 +14,8 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 
-from config import DATABASE_URL
+from config import DATABASE_URL, ENVIRONMENT
+from test_database import test_target
 from database import get_db
 from main import app
 from models import BankAccount, DemoBank, User
@@ -53,13 +55,16 @@ class PaymentDatabaseTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         source = make_url(DATABASE_URL)
-        cls.test_url = source.set(database="payflow_phase4_tests")
-        if source.database == cls.test_url.database:
-            raise RuntimeError("Development DATABASE_URL must not point at the dedicated payment test database")
+        name = os.getenv('PAYFLOW_TEST_DATABASE','payflow_phase4_tests')
+        explicit_url = os.getenv('PAYFLOW_TEST_DATABASE_URL')
+        cls.test_url = test_target(DATABASE_URL,name,explicit_url,ENVIRONMENT)
+        # Explicit URLs use a pre-provisioned dedicated role/database; no CREATEDB needed.
+        if explicit_url:
+            return
         admin = create_engine(source, isolation_level="AUTOCOMMIT", connect_args={"connect_timeout": 5})
         with admin.connect() as connection:
             if not connection.execute(text("SELECT 1 FROM pg_database WHERE datname=:name"), {"name": cls.test_url.database}).scalar():
-                connection.exec_driver_sql('CREATE DATABASE "payflow_phase4_tests"')
+                connection.exec_driver_sql(f'CREATE DATABASE "{name}"')
         admin.dispose()
 
     def setUp(self):

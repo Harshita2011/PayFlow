@@ -1,0 +1,10 @@
+.env*
+node_modules/
+dist/
+.git/
+*.log
+.verification*
+qa/
+test-artifacts/
+playwright-report/
+test-results/

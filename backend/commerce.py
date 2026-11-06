@@ -49,9 +49,9 @@ def billers(user: User = Depends(get_current_user), db: Session = Depends(get_db
     return list(db.scalars(select(DemoBiller).where(DemoBiller.active.is_(True)).order_by(DemoBiller.category)))
 
 
-def bill_view(row, db):
+def bill_view(row, db, today=None):
     bill, biller, payment = row
-    today = db.scalar(select(func.current_date()))
+    today = today if today is not None else db.scalar(select(func.current_date()))
     return BillOut(id=bill.id, biller_id=biller.id, biller=biller.name, category=biller.category,
         masked_reference="DEMO••" + bill.reference[-4:], billing_period=bill.billing_period, amount_due=bill.amount_due,
         due_date=bill.due_date, status="OVERDUE" if bill.status == "UNPAID" and bill.due_date < today else bill.status,
@@ -116,7 +116,8 @@ def bills(limit: int = Query(10, ge=1, le=50), before: UUID | None = None, paid_
             raise HTTPException(404, "Bill not found")
         query = query.where(tuple_(UtilityBill.created_at, UtilityBill.id) < (cursor.created_at, cursor.id))
     rows = db.execute(query.order_by(UtilityBill.created_at.desc(), UtilityBill.id.desc()).limit(limit + 1)).all()
-    return CommercePage(items=[bill_view(row, db) for row in rows[:limit]], next_cursor=rows[limit-1][0].id if len(rows) > limit else None)
+    today = db.scalar(select(func.current_date()))
+    return CommercePage(items=[bill_view(row, db, today) for row in rows[:limit]], next_cursor=rows[limit-1][0].id if len(rows) > limit else None)
 
 
 @router.get("/bills/{bill_id}", response_model=BillOut)

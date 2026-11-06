@@ -3,12 +3,14 @@ from sqlalchemy import create_engine, pool
 
 from config import DATABASE_URL
 from database import Base
+from migration_lock import migration_lock
 import models  # Register all model metadata for future migration comparisons.
 import payment_models
 import social_models
 import split_models
 import commerce_models
 import security_models
+import outbox_models
 
 
 target_metadata = Base.metadata
@@ -34,5 +36,6 @@ else:
             # Fail rather than wait indefinitely for an application transaction.
             connection.exec_driver_sql("SET lock_timeout = '5s'")
             connection.commit()
-            run_migrations(connection)
+            with migration_lock(connection):
+                run_migrations(connection)
         engine.dispose()

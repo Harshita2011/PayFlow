@@ -202,7 +202,7 @@ describe('Fictional bills and recharge', () => {
   })
   it('recovers a stored purchase after unmount with its original key', async () => {
     const mock = setup()
-    const key = 'a21e7082-e874-4a02-ad74-096f8b428631'
+    const key = '00000000-0000-4000-8000-000000000001'
     sessionStorage.setItem('payflow.pending.17', JSON.stringify({ key, kind: 'purchase', uncertain: true, purchase: { kind: 'recharge', amount: '99.00', label: 'Demo Starter', source_account_id: 17, recharge: { plan_id: plan.id, source_account_id: 17, mobile: '9876543210' } } }))
     render(<PaymentPanel token="token" accountId={17} accounts={[{ ...account, balance: '0.00' }]} senderAccount={{ ...account, balance: '0.00' }} onLogout={vi.fn()} onBalanceChanged={vi.fn()} view="bills" />)
     fireEvent.click(await screen.findByRole('button', { name: 'Retry same request' }))

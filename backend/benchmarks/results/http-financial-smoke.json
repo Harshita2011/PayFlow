@@ -1,0 +1,64 @@
+{
+  "new_commit_responses": 48,
+  "financial_failures": 0,
+  "idempotent_replays": 48,
+  "uncertain": 0,
+  "committed": 48,
+  "failed": 0,
+  "outbox": {
+    "PENDING": 18,
+    "PROCESSED": 61,
+    "PROCESSING": 5
+  },
+  "deadlocks": 0,
+  "connections": 6,
+  "lock_waiters": 0,
+  "seconds": 5.272,
+  "committed_tps": 9.105,
+  "http_requests": 144,
+  "http_failures": 0,
+  "http_rps": 27.315,
+  "http_p50_ms": 370,
+  "http_p95_ms": 1000,
+  "http_p99_ms": 1100,
+  "http_routes": [
+    {
+      "name": "/security/payment-authorizations",
+      "method": "POST",
+      "requests": 48,
+      "failures": 0
+    },
+    {
+      "name": "/payments/intent/TRANSFER",
+      "method": "POST",
+      "requests": 48,
+      "failures": 0
+    },
+    {
+      "name": "/payments/replay/TRANSFER",
+      "method": "POST",
+      "requests": 48,
+      "failures": 0
+    }
+  ],
+  "committed_intent_p50_ms": 873.32,
+  "committed_intent_p95_ms": 1789.0,
+  "committed_intent_p99_ms": 2019.27,
+  "intent_latency_samples": 48,
+  "users": 12,
+  "source_accounts": 12,
+  "owned_accounts": 24,
+  "api_workers": 1,
+  "security_overrides": false,
+  "mode": "financial",
+  "target_financial_tps": "10",
+  "api_fixture_pool_size": 5,
+  "api_fixture_max_overflow": 10,
+  "worker_pool_size": 2,
+  "worker_max_overflow": 0,
+  "hardware_cpu": "AMD Ryzen 7 6800HS Creator Edition",
+  "hardware_logical_processors": 16,
+  "host_ram_gib": 13.7,
+  "postgres_memory_budget_gib": 6.621,
+  "load_generator_on_api_host": true
+}

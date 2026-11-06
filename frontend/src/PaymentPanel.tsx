@@ -387,6 +387,7 @@ export default function PaymentPanel({ token, accountId, senderAccount, onLogout
       {(receipt.type === 'MOBILE_RECHARGE' || receipt.type === 'BILL_PAYMENT') && <p>From {receipt.source_bank} · {receipt.source_masked_account}<br />Fictional fulfillment only. No real service provided.</p>}
       {receipt.type === 'SELF_TRANSFER' && <p>From {receipt.source_bank} · {receipt.source_masked_account}<br />To {receipt.destination_bank} · {receipt.destination_masked_account}<br />No change to your combined funds.</p>}
       <p className="receipt-id">Transaction ID<br />{receipt.transaction_id}</p>
+      {receipt.status === 'SUCCESS' && <p className="account-note">This receipt confirms the committed payment. Activity notifications may arrive later.</p>}
       <p>{new Date(receipt.created_at).toLocaleString()}{receipt.note && <><br />{receipt.note}</>}</p>
       {receipt.failure_reason && <p>{receipt.failure_reason} · No funds moved.</p>}
     </article>}

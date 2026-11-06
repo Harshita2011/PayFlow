@@ -35,10 +35,10 @@ class MigrationTests(unittest.TestCase):
         command.upgrade(self.config, "head")
         command.upgrade(self.config, "head")
         inspector = inspect(self.connection)
-        self.assertEqual(set(inspector.get_table_names()), {"users", "bank_accounts", "alembic_version", "ledger_accounts", "payments", "ledger_entries", "payment_requests", "recipient_lookup_limits", "contacts", "money_requests", "request_creation_limits", "money_request_destinations", "expense_splits", "expense_split_participants", "split_request_links", "demo_operators", "demo_recharge_plans", "demo_billers", "mobile_recharges", "utility_bills", "saved_billers", "payment_pin_credentials", "payment_authorizations", "payment_limit_counters", "security_rate_windows", "security_audit_events", "fraud_risk_decisions"})
+        self.assertEqual(set(inspector.get_table_names()), {"users", "bank_accounts", "alembic_version", "ledger_accounts", "payments", "ledger_entries", "payment_requests", "recipient_lookup_limits", "contacts", "money_requests", "request_creation_limits", "money_request_destinations", "expense_splits", "expense_split_participants", "split_request_links", "demo_operators", "demo_recharge_plans", "demo_billers", "mobile_recharges", "utility_bills", "saved_billers", "payment_pin_credentials", "payment_authorizations", "payment_limit_counters", "security_rate_windows", "security_audit_events", "fraud_risk_decisions", "outbox_events", "activity_notifications"})
         balance = next(c for c in inspector.get_columns("bank_accounts") if c["name"] == "balance")
         self.assertEqual((balance["type"].precision, balance["type"].scale), (18, 2))
-        self.assertEqual(self.connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one(), "0008_payment_security")
+        self.assertEqual(self.connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one(), "0009_reliability_outbox")
         command.check(self.config)
 
     def test_existing_users_are_adopted_without_changes(self):

@@ -1,0 +1,93 @@
+name: payflow-demo
+x-backend: &backend
+  image: payflow-demo-backend:local
+  build:
+    context: ./backend
+    target: runtime
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  stop_grace_period: 40s
+x-common-env: &common-env
+  PAYFLOW_ENV: development
+  JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Generate .env.compose with tools/init_compose.py}
+  CORS_ALLOWED_ORIGINS: http://localhost:${PAYFLOW_HTTP_PORT:-18080},http://127.0.0.1:${PAYFLOW_HTTP_PORT:-18080}
+  PAYFLOW_EXPOSE_DOCS: '0'
+  LOG_LEVEL: INFO
+  DB_POOL_SIZE: '3'
+  DB_MAX_OVERFLOW: '2'
+  PAYFLOW_OPS_TOKEN: ${PAYFLOW_OPS_TOKEN:-}
+services:
+  postgres:
+    image: postgres:16-bookworm@sha256:5264710be20f409750ac6dc4e5706dcef929c87e241605463f0f9aefa932a8d9
+    environment:
+      POSTGRES_USER: payflow_admin
+      POSTGRES_DB: payflow_demo
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?Generate .env.compose}
+      PAYFLOW_OWNER_PASSWORD: ${PAYFLOW_OWNER_PASSWORD:?Generate .env.compose}
+      PAYFLOW_APP_PASSWORD: ${PAYFLOW_APP_PASSWORD:?Generate .env.compose}
+      PAYFLOW_WORKER_PASSWORD: ${PAYFLOW_WORKER_PASSWORD:?Generate .env.compose}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./deploy/postgres-init.sh:/docker-entrypoint-initdb.d/10-payflow-roles.sh:ro
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U payflow_admin -d payflow_demo']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  migrate:
+    <<: *backend
+    environment:
+      <<: *common-env
+      DATABASE_URL: postgresql+psycopg://payflow_owner:${PAYFLOW_OWNER_PASSWORD}@postgres:5432/payflow_demo
+      PAYFLOW_LOCAL_ROLE_GRANTS: '1'
+      JWT_SECRET_KEY: ${WORKER_CONFIG_KEY:?Generate a separate non-signing worker configuration key}
+    command: [python, -m, migrate, --apply, --expected-current, '${MIGRATION_EXPECTED_REVISION:-base}', --grant-local-roles]
+    depends_on:
+      postgres: {condition: service_healthy}
+    healthcheck: {disable: true}
+  api:
+    <<: *backend
+    environment:
+      <<: *common-env
+      DATABASE_URL: postgresql+psycopg://payflow_app:${PAYFLOW_APP_PASSWORD}@postgres:5432/payflow_demo
+      PORT: '8001'
+      WEB_CONCURRENCY: '1'
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    restart: unless-stopped
+  worker:
+    <<: *backend
+    environment:
+      <<: *common-env
+      DATABASE_URL: postgresql+psycopg://payflow_worker:${PAYFLOW_WORKER_PASSWORD}@postgres:5432/payflow_demo
+      WORKER_HEARTBEAT_FILE: /tmp/payflow-worker-heartbeat
+      JWT_SECRET_KEY: ${WORKER_CONFIG_KEY:?Generate a separate non-signing worker configuration key}
+    command: [python, -m, outbox_worker]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD, python, -m, worker_health]
+      interval: 15s
+      timeout: 3s
+      start_period: 15s
+      retries: 3
+    restart: unless-stopped
+  frontend:
+    image: payflow-demo-frontend:local
+    build: {context: ./frontend, args: {VITE_API_BASE_URL: /api}}
+    ports: ['127.0.0.1:${PAYFLOW_HTTP_PORT:-18080}:8080']
+    read_only: true
+    tmpfs: ['/tmp:size=16m,mode=1777']
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      api: {condition: service_healthy}
+    restart: unless-stopped
+volumes:
+  postgres-data:
+    name: payflow_demo_pgdata

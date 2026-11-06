@@ -35,29 +35,39 @@ export class ApiError extends Error {
 }
 
 export async function apiRequest<T>(path: string, options: RequestInit = {}): Promise<T> {
-  let response: Response
+  const controller = new AbortController()
+  const cancel = () => controller.abort()
+  options.signal?.addEventListener('abort', cancel, { once: true })
+  if (options.signal?.aborted) controller.abort()
+  const timer = setTimeout(cancel, 10000)
   try {
-    response = await fetch(`${API_BASE_URL}${path}`, {
+    const response = await fetch(`${API_BASE_URL}${path}`, {
       ...options,
       cache: 'no-store',
-      signal: AbortSignal.timeout(10000),
+      signal: controller.signal,
       headers: { 'Content-Type': 'application/json', ...options.headers },
     })
-  } catch {
-    throw new ApiError('Could not reach PayFlow. Check that the backend is running and try again.', 0)
+    if (response.ok && response.status === 204) return undefined as T
+    const data = await response.json()
+    if (!response.ok) {
+      const detail = data?.detail
+      const message = typeof detail === 'string' ? detail
+        : Array.isArray(detail) ? detail.map((error: { loc?: string[]; msg?: string }) =>
+          `${error.loc?.at(-1) || 'Input'}: ${error.msg || 'Invalid value'}`).join('. ')
+        : 'Something went wrong. Please try again.'
+      throw new ApiError(message, response.status, data)
+    }
+    if (data === null) throw new ApiError('The server returned an unexpected response. Please try again.', response.status)
+    return data as T
+  } catch (error) {
+    if (error instanceof ApiError) throw error
+    throw new ApiError(controller.signal.aborted
+      ? 'The request timed out or was cancelled. For a payment, recover the original request before starting another.'
+      : 'Could not reach PayFlow or read a complete response. For a payment, keep the original request and retry it.', 0)
+  } finally {
+    clearTimeout(timer)
+    options.signal?.removeEventListener('abort', cancel)
   }
-  if (response.ok && response.status === 204) return undefined as T
-  const data = await response.json().catch(() => null)
-  if (!response.ok) {
-    const detail = data?.detail
-    const message = typeof detail === 'string' ? detail
-      : Array.isArray(detail) ? detail.map((error: { loc?: string[]; msg?: string }) =>
-        `${error.loc?.at(-1) || 'Input'}: ${error.msg || 'Invalid value'}`).join('. ')
-      : 'Something went wrong. Please try again.'
-    throw new ApiError(message, response.status, data)
-  }
-  if (data === null) throw new ApiError('The server returned an unexpected response. Please try again.', response.status)
-  return data as T
 }
 
 export function registerUser(full_name: string, email: string, password: string) {

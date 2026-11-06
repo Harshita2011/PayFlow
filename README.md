@@ -20,10 +20,12 @@ PayFlow demonstrates relational data modeling, authentication and authorization,
 - [Payment processing architecture](#payment-processing-architecture)
 - [Database design](#database-design)
 - [Security and reliability](#security-and-reliability)
+- [Reliable delivery and operations](#reliable-delivery-and-operations)
 - [Project structure](#project-structure)
 - [Getting started](#getting-started)
 - [Environment variables](#environment-variables)
 - [Running the application](#running-the-application)
+- [Containers and deployment](#containers-and-deployment)
 - [Testing and verification](#testing-and-verification)
 - [API overview](#api-overview)
 - [Demo workflow](#demo-workflow)
@@ -47,6 +49,7 @@ The interface exposes these systems through recipient verification, explicit con
 | --- | --- |
 | Authentication | Registration, Argon2id password hashing, throttled JWT Bearer login, protected profile, client-side logout, and session-expiry handling |
 | Payment security | Separate six-digit PIN, password-authenticated setup, PIN change/temporary lockout, one-payment grants, UTC daily limits, explainable risk rules, and private security activity |
+| Reliability | Atomic payment outbox, separately leased notification worker, crash/retry recovery, live/ready probes, structured correlation logs and opt-in metrics |
 | Bank accounts and UPI IDs | Up to four fictional accounts per user, primary selection, generated account numbers and unique `@payflow` IDs, masked displays, and exact decimal balances |
 | Payments | Exact-ID recipient lookup, owned source selection, incoming/outgoing transfers, self-transfers, receipts, cursor-paginated history, and retry recovery |
 | Demo funding | ₹1,000 per action, limited to three successful funding actions per user across all their accounts |
@@ -76,9 +79,9 @@ Important product semantics:
 | Authentication | pwdlib with Argon2, PyJWT | Argon2id password verification and signed HS256 access tokens |
 | QR | `qrcode`, `@zxing/browser`, `@zxing/library` | Browser-side PNG generation and camera/image decoding |
 | Tests | Python `unittest`, FastAPI TestClient/httpx, Vitest, React Testing Library, jsdom | Backend integration and frontend behavior tests |
-| Infrastructure and QA | Docker, Playwright scripts | Local PostgreSQL and optional isolated browser verification |
+| Infrastructure and QA | Docker Compose, GitHub Actions, Playwright, Bandit, Gitleaks | Separate local demo stack, isolated browser tests and CI validation |
 
-Dependencies are declared in [requirements.txt](backend/requirements.txt), [requirements-dev.txt](backend/requirements-dev.txt), and [package.json](frontend/package.json). The frontend includes an npm lockfile.
+Dependency inputs are declared in [requirements.txt](backend/requirements.txt), [requirements-dev.txt](backend/requirements-dev.txt), and [package.json](frontend/package.json). Reproducible installs use the hash-checked Python `requirements*.lock` files and the frontend npm lockfile.
 
 ## System architecture
 
@@ -212,7 +215,7 @@ Splits are `OPEN`, `SETTLED`, or `CANCELLED`; settlement requires every owed con
 
 Internal funding/settlement accounts are ledger entities, not artificial users or bank accounts. They have no public credentials and cannot appear as selectable funding/self-transfer accounts.
 
-The [migration chain](backend/migrations/versions) has repository head `0008_payment_security`. Upgrades preserve history; downgrades are intentionally refused. Normal operation uses migrations, not `Base.metadata.create_all`.
+The [migration chain](backend/migrations/versions) has repository head `0009_reliability_outbox`. Upgrades preserve history; downgrades are intentionally refused. Normal operation uses migrations, not `Base.metadata.create_all`.
 
 ## Security and reliability
 
@@ -249,6 +252,31 @@ See [Security architecture and threat model](docs/SECURITY.md) for rule threshol
 
 Logout clears React state but **does not revoke an issued JWT**; it remains valid until expiry. Refresh requires signing in again. Database owners can alter triggers, so production operation would need separate runtime/migration privileges and the additional controls under [Limitations](#limitations).
 
+## Reliable delivery and operations
+
+Every new successful payment creates a versioned, minimal outbox event in the **same PostgreSQL transaction** as its ledger. A separate `python -m outbox_worker` process claims bounded batches with `FOR UPDATE SKIP LOCKED`, expiring fenced leases, exponential retry and dead-letter state. It creates owner-scoped in-app notification records with unique event/user deduplication. Notifications are at least once and may be delayed; they never determine financial success or change balances. The dashboard receipt remains authoritative for the committed result.
+
+```mermaid
+flowchart LR
+  API[FastAPI posting transaction] --> DB[(Payment + ledger + outbox)]
+  DB --> Receipt[Committed receipt]
+  DB --> Worker[Separate leased worker]
+  Worker --> Activity[Idempotent participant notifications]
+```
+
+Run workers in separate terminals; do not attach financial background jobs to the API:
+
+```powershell
+Set-Location backend
+.\.venv\Scripts\python.exe -m outbox_worker
+```
+
+`GET /health/live` is database-independent; `GET /health/ready` checks PostgreSQL and the expected migration. `/metrics` is disabled unless a separate `PAYFLOW_OPS_TOKEN` is configured and supplied in `X-Ops-Token`. It exports low-cardinality HTTP durations/counts, payment/replay/error counters, pool utilization, outbox depth/lag/attempts, and database connection/lock/deadlock gauges. Logs use validated request/correlation UUIDs and route templates without bodies, raw query strings or credentials.
+
+API and worker processes share correctness-critical PostgreSQL state. For local multi-worker use, run `python -m uvicorn main:app --port 8001 --workers 2 --no-proxy-headers --no-access-log`. Each process has its own bounded pool; default maximum is 10 connections/process, so account for all API/worker processes and reserve database headroom. Per-process metrics require independently scraped instances; a shared multi-worker port does not aggregate counters.
+
+See [Reliability and operations](docs/reliability.md) for leases, failure recovery, metrics and configuration, [measured performance](docs/performance.md) for bounded benchmark results and commands, and [scaling toward 1M TPM](docs/scaling-to-1m-tpm.md) for a **proposed, unachieved** architecture target. Redis, Kafka, financial sharding, settlement lanes and production failover are not implemented. Authoritative balances remain strongly coordinated in PostgreSQL.
+
 ## Project structure
 
 ```text
@@ -265,9 +293,14 @@ PayFlow/
 │   ├── pin_security.py, pin_schemas.py, payment_policy.py
 │   ├── security_models.py, security_events.py, security_settings.py
 │   ├── security_retention.py
+│   ├── outbox.py, outbox_models.py, outbox_worker.py
+│   ├── operations.py, observability.py, reliability_config.py
+│   ├── migrate.py, migration_lock.py, serve.py, worker_health.py
 │   ├── migrations/versions/
 │   ├── tests/
+│   ├── benchmarks/                  # Isolated workloads and measured results
 │   ├── alembic.ini, requirements.txt, requirements-dev.txt
+│   ├── requirements*.lock, Dockerfile
 │   └── .env.example
 ├── frontend/
 │   ├── src/
@@ -282,8 +315,17 @@ PayFlow/
 │   ├── public/
 │   ├── qa/                         # Isolated backend and browser harnesses
 │   ├── package.json, package-lock.json
+│   ├── Dockerfile, nginx.conf, vercel.json
 │   └── .env.example
-├── docs/SECURITY.md
+├── docs/
+│   ├── SECURITY.md, reliability.md, performance.md
+│   ├── deployment.md, testing.md, backup-recovery.md
+│   ├── deployment-smoke.md, verification.md
+│   └── scaling-to-1m-tpm.md
+├── .github/workflows/ci.yml
+├── tools/                          # Guarded CI, smoke and restore utilities
+├── deploy/postgres-init.sh
+├── docker-compose.yml, render.yaml
 └── README.md
 ```
 
@@ -310,7 +352,7 @@ From the repository root:
 ```powershell
 Set-Location backend
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m pip install --require-hashes -r requirements-dev.lock
 if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 ```
 
@@ -368,6 +410,9 @@ The frontend defaults to `http://localhost:8001`. No credentials belong in its e
 | Variable | Location | Required | Purpose and safe example |
 | --- | --- | --- | --- |
 | `DATABASE_URL` | Backend environment or `backend/.env` | Yes | SQLAlchemy/psycopg URL: `postgresql+psycopg://payflow:YOUR_URL_ENCODED_PASSWORD@127.0.0.1:5436/payflow` |
+| `PAYFLOW_ENV` | Backend/worker | No | `development` (default), `test`, or `demo`; demo requires HTTPS CORS and database TLS |
+| `CORS_ALLOWED_ORIGINS` | Backend | No | Exact comma-separated origins; defaults to localhost/127.0.0.1:5173, no wildcards |
+| `PAYFLOW_EXPOSE_DOCS`, `LOG_LEVEL` | Backend | No | Docs default off in demo; INFO/WARNING/ERROR logging |
 | `JWT_SECRET_KEY` | Backend environment or `backend/.env` | Yes | Random signing key of at least 32 bytes; generate locally rather than copying a sample secret |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | Backend | No | Access-token lifetime, integer 1–60; default `15` |
 | `PAYFLOW_DEMO_MOBILE_PREFIXES` | Backend | No | One to ten ASCII digits allowed as the first digit of a ten-digit demo mobile number; default `6789` |
@@ -380,6 +425,13 @@ The frontend defaults to `http://localhost:8001`. No credentials belong in its e
 | `RISK_*` | Backend | No | Exact rule settings/defaults are enumerated in `.env.example` and [SECURITY.md](docs/SECURITY.md) |
 | `SECURITY_RETENTION_DAYS` | Backend | No | Recent event visibility/operator retention cutoff; default `90`, no scheduled purge |
 | `REGISTER_TEST_POSTGRES` | Backend test process only | No | Set to `1` for PostgreSQL integration tests; leave unset for the limited SQLite suite |
+| `PAYFLOW_TEST_DATABASE` | Test/benchmark process only | No | Validated isolated `payflow_*_tests` database; default `payflow_phase4_tests`; never the development database |
+| `PAYFLOW_TEST_DATABASE_URL` | Test process only | No | Optional separate credentials for a pre-provisioned test database; must match the declared test name |
+| `PORT`, `WEB_CONCURRENCY`, `PAYFLOW_MAX_CONCURRENCY` | Container/cloud entry point | No | Defaults 8001/1/16; budget memory and database connections per process |
+| `DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT_SECONDS`, `DB_POOL_RECYCLE_SECONDS` | Backend/worker | No | Per-process defaults `5`, `5`, `5`, `1800` |
+| `DB_CONNECT_TIMEOUT_SECONDS`, `DB_STATEMENT_TIMEOUT_MS`, `DB_LOCK_TIMEOUT_MS` | Backend/worker | No | Bounded waits; defaults `5`, `15000`, `5000` |
+| `OUTBOX_BATCH_SIZE`, `OUTBOX_LEASE_SECONDS`, `OUTBOX_MAX_ATTEMPTS`, `OUTBOX_POLL_SECONDS` | Worker | No | Defaults `10`, `30`, `5`, `1` |
+| `PAYFLOW_OPS_TOKEN` | Backend operator environment | No | Empty disables metrics; otherwise a separately generated random 32+ byte token, never a frontend value |
 
 Safe templates exist at [backend/.env.example](backend/.env.example) and [frontend/.env.example](frontend/.env.example). Local environment files are ignored by Git. Backend configuration reads its adjacent `.env`; frontend `VITE_` values become public build configuration. Restart the relevant server after changes and rebuild the frontend for changed production values.
 
@@ -395,7 +447,7 @@ Run each block from the repository root in a separate PowerShell terminal.
 docker start payflow-postgres-5436
 Set-Location backend
 .\.venv\Scripts\python.exe -m alembic upgrade head
-.\.venv\Scripts\python.exe -m uvicorn main:app --reload --port 8001 --no-proxy-headers
+.\.venv\Scripts\python.exe -m uvicorn main:app --reload --port 8001 --no-proxy-headers --no-access-log
 ```
 
 **Frontend:**
@@ -412,7 +464,30 @@ npm run dev -- --port 5173 --strictPort
 
 `--strictPort` prevents Vite moving silently outside the CORS allowlist. These commands start development servers; the repository does not provide production deployment configuration.
 
+## Containers and deployment
+
+An optional, separate local stack packages the frontend, API, durable worker, migration runner and persistent PostgreSQL. It does **not** use or replace the existing `payflow-postgres-5436` container. From the repository root:
+
+```powershell
+python tools/init_compose.py
+docker compose --env-file .env.compose config --quiet
+docker compose --env-file .env.compose up -d --build --wait
+```
+
+The initializer refuses to overwrite an existing private environment file. Open [the local simulated demo](http://localhost:18080). Only its frontend proxy is published to loopback; API/worker run non-root with separate restricted database roles. Data persists in `payflow_demo_pgdata`. Stop with `docker compose --env-file .env.compose stop`; do not remove volumes.
+
+```powershell
+python tools/deployment_smoke.py
+docker compose --env-file .env.compose exec api python -m reconcile
+```
+
+GitHub Actions defines backend/PostgreSQL, frontend, security, isolated E2E and container/restore jobs with read-only permissions, immutable action SHAs and no deployment credentials. Local workflow syntax was validated; **the workflow has not run on GitHub**. No commit, push, public deployment or billable resource creation was performed.
+
+Cloud configuration is prepared for a Vercel static frontend plus a Render API/worker and separately provisioned persistent managed PostgreSQL. Automatic deployment is disabled; owner migrations and public release require explicit review/approval. No hosted URL exists. See [deployment instructions](docs/deployment.md), [test/CI workflow](docs/testing.md), [backup/recovery](docs/backup-recovery.md), the [post-deployment checklist](docs/deployment-smoke.md), and [executed verification](docs/verification.md) for configuration, current provider assumptions, safety gates and exact commands.
+
 ## Testing and verification
+
+Latest executed checks: **225 PostgreSQL backend tests** and **190 frontend tests** passed; TypeScript, ESLint, production build, Alembic consistency and ledger reconciliation passed. The managed runner passed five Chromium scenarios with worker drain and data-preservation checks. The separate Compose stack and its backup/restore exercise passed locally. These are verification results, not cloud-deployment or load-capacity claims; [performance.md](docs/performance.md) records the separately measured bounded workloads and limitations.
 
 ### Backend
 
@@ -432,7 +507,7 @@ Remove-Item Env:REGISTER_TEST_POSTGRES
 
 Tests cover PIN setup/lockout/change, grant binding/expiry/consumption, UTC counters, limits/risk/rate failures, audit privacy, authorization, exact amounts, ledger balance, rollback injection, retry/concurrency and request/split/service regressions. Security fixtures do not reset the development database.
 
-**Integration-test isolation:** payment tests create fresh schemas in the separate `payflow_phase4_tests` database, with independent sessions and real commits. The PostgreSQL role needs permission to create that database once and create schemas there. Authentication/account and migration tests also use the dedicated test database, with outer rollback transactions and isolated schemas. Dedicated committed test schemas are deliberately retained. Legacy payment regression helpers obtain real PIN grants and explicitly relax configured risk thresholds in their fixture process; dedicated security tests and default browser QA enforce the actual defaults. PostgreSQL tests are therefore not read-only operations even though they preserve development records.
+**Integration-test isolation:** payment tests create fresh schemas in a separate database (default `payflow_phase4_tests`, or a validated `PAYFLOW_TEST_DATABASE`), with independent sessions and real commits. The PostgreSQL role needs permission to create that database once and create schemas there. Authentication/account and migration tests also use the dedicated test database, with outer rollback transactions and isolated schemas. Dedicated committed test schemas are deliberately retained. Legacy payment regression helpers obtain real PIN grants and explicitly relax configured risk thresholds in their fixture process; dedicated security tests and default browser QA enforce the actual defaults. PostgreSQL tests are therefore not read-only operations even though they preserve development records.
 
 ### Frontend
 
@@ -462,7 +537,7 @@ From `backend`, with the database already migrated:
 
 ### Optional browser verification
 
-[frontend/qa](frontend/qa) contains Playwright scripts and `isolated_backend.py` for real-browser flows, lost responses after commit, same-key retries, and responsive checks. Playwright requires a separate installation; it is not a frontend dependency.
+[frontend/qa](frontend/qa) contains a repository-pinned Playwright runner, `isolated_backend.py`, real-worker integration, lost-response recovery and responsive scenarios. From `frontend`, run `npx playwright install chromium`, then `npm run test:e2e`. The managed runner uses dedicated loopback ports 5180/18016, fresh test schemas and masked/redacted failure diagnostics; it never targets the development API. See [testing.md](docs/testing.md).
 
 Use the isolated backend on `127.0.0.1:18016` and a separate Vite process with `VITE_API_BASE_URL=http://127.0.0.1:18016`. Harnesses block writes outside that backend. Shutdown checks reconcile its ledger and compare development-record snapshots. These scripts create isolated test records and run test-schema migrations; do not point them at ordinary development payment endpoints. Headless checks do not establish physical-camera or assistive-technology compatibility.
 
@@ -475,6 +550,8 @@ User-specific routes require a Bearer token. New sensitive payments additionally
 | Group | Method and route | Purpose |
 | --- | --- | --- |
 | Security | `GET /security/status`, `GET /security/events` | Own PIN/limit status and paginated security activity |
+| Reliability | `GET /health/live`, `GET /health/ready` | Process liveness and database/schema readiness |
+| Activity | `GET /activity/notifications` | JWT-protected, owner-only asynchronous payment references |
 | Security | `POST /security/pin`, `POST /security/pin/change` | Password-authenticated initial setup and current-PIN-authenticated change; no reset endpoint |
 | Security | `POST /security/payment-authorizations` | Verify PIN and issue a short-lived grant bound to an intended payment/key |
 | Authentication | `POST /register`, `POST /login`, `GET /me` | Create a user, obtain a token, and retrieve the authenticated profile |
@@ -555,13 +632,13 @@ No application screenshots are currently committed. The image under `frontend/sr
 - Fulfillment is synchronous and fictional. Synthetic bill references are stored in plain text. Recharge records retain only masked numbers; unresolved browser intents temporarily retain the original number for exact retry.
 - Deliberately small demo limits: four accounts, three user-wide funding actions, ten split participants, 100 generated bills, and 20 saved billers per user. No automated funding reset or idempotency-record expiry exists. Security retention requires an explicit operator action.
 - Retry metadata is tab/session scoped. Clearing it or switching devices loses the frontend recovery context; inspect history before starting a replacement payment.
-- No committed deployment pipeline, Compose configuration, or hosted-demo URL is provided. Browser harnesses do not prove physical-device/camera or screen-reader compatibility.
+- Compose, CI and provider configuration are present, but no public deployment or GitHub-hosted CI execution has been verified. Browser harnesses do not prove physical-device/camera or screen-reader compatibility.
 
 ## Future improvements
 
 - Harden session management, account recovery, and abuse prevention.
-- Add redacted observability, operational alerts, and stronger fraud/rate-limit analysis.
-- Establish CI/CD with isolated PostgreSQL concurrency tests and repeatable deployment configuration.
+- Extend observability with operational alerts, distributed tracing and stronger fraud/rate-limit analysis.
+- Verify the prepared CI on GitHub and the approved cloud release, then add provider alerts, image OS scanning and repeated restore drills.
 - Review database privileges, secret management, backups, recovery procedures, and accounting-query scaling before public deployment.
 - Extend accessibility and physical-device testing; add committed product screenshots.
 - Explore durable asynchronous fulfillment/recovery only if the simulator's scope requires it.

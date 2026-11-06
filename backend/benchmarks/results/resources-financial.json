@@ -1,0 +1,62 @@
+[
+  {
+    "timestamp": 1793889207.27231,
+    "postgres_container_cpu_and_memory": "0.31%|894.7MiB / 6.621GiB",
+    "db": {
+      "committed": 0,
+      "failed": 0,
+      "outbox": {
+        "PROCESSED": 36
+      },
+      "deadlocks": 0,
+      "connections": 2,
+      "lock_waiters": 0
+    }
+  },
+  {
+    "timestamp": 1793889209.0013943,
+    "postgres_container_cpu_and_memory": "40.76%|918.6MiB / 6.621GiB",
+    "db": {
+      "committed": 15,
+      "failed": 0,
+      "outbox": {
+        "PENDING": 5,
+        "PROCESSED": 41,
+        "PROCESSING": 5
+      },
+      "deadlocks": 0,
+      "connections": 13,
+      "lock_waiters": 0
+    }
+  },
+  {
+    "timestamp": 1793889212.4149628,
+    "postgres_container_cpu_and_memory": "57.11%|928.2MiB / 6.621GiB",
+    "db": {
+      "committed": 35,
+      "failed": 0,
+      "outbox": {
+        "PENDING": 15,
+        "PROCESSED": 56
+      },
+      "deadlocks": 0,
+      "connections": 10,
+      "lock_waiters": 0
+    }
+  },
+  {
+    "timestamp": 1793889214.328272,
+    "postgres_container_cpu_and_memory": "11.66%|897.7MiB / 6.621GiB",
+    "db": {
+      "committed": 48,
+      "failed": 0,
+      "outbox": {
+        "PENDING": 18,
+        "PROCESSED": 66
+      },
+      "deadlocks": 0,
+      "connections": 6,
+      "lock_waiters": 0
+    }
+  }
+]

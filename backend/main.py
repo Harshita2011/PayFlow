@@ -1,5 +1,6 @@
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from contextlib import asynccontextmanager
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -8,7 +9,9 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from database import get_db, test_connection
+from database import engine, get_db, test_connection
+from operations import router as operations_router
+from observability import RequestTelemetry
 from accounts import router as accounts_router
 from payments import router as payments_router
 from social import router as social_router
@@ -18,18 +21,28 @@ from pin_security import router as pin_security_router
 from security_events import PolicyError, audit, enforce_rate
 from security_settings import settings
 from models import User
-from config import ACCESS_TOKEN_EXPIRE_MINUTES
+from config import ACCESS_TOKEN_EXPIRE_MINUTES, CORS_ALLOWED_ORIGINS, ENVIRONMENT, EXPOSE_DOCS
 from schemas import LoginRequest, RegisterRequest, TokenResponse, UserResponse
 from security import (
     create_access_token, dummy_password_hash, get_current_user,
     password_hasher, unauthorized,
 )
 
+@asynccontextmanager
+async def lifespan(app):
+    yield
+    engine.dispose()  # Each worker owns its own bounded pool; no worker runs in the API.
+
+
 # Create the FastAPI application
 app = FastAPI(
+    lifespan=lifespan,
     title="PayFlow API",
     description="Backend for PayFlow UPI Payment Simulation",
-    version="1.0.0"
+    version="1.0.0",
+    docs_url='/docs' if EXPOSE_DOCS == '1' else None,
+    redoc_url='/redoc' if EXPOSE_DOCS == '1' else None,
+    openapi_url='/openapi.json' if EXPOSE_DOCS == '1' else None,
 )
 app.include_router(accounts_router)
 app.include_router(payments_router)
@@ -37,17 +50,17 @@ app.include_router(social_router)
 app.include_router(splits_router)
 app.include_router(commerce_router)
 app.include_router(pin_security_router)
+app.include_router(operations_router)
+app.add_middleware(RequestTelemetry)
 
 # Allow React frontend to communicate with FastAPI
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173"
-    ],
+    allow_origins=CORS_ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "PATCH", "DELETE"],
-    allow_headers=["Content-Type", "Authorization", "Idempotency-Key", "Payment-Authorization"],
+    allow_headers=["Content-Type", "Authorization", "Idempotency-Key", "Payment-Authorization", "X-Request-ID", "X-Correlation-ID"],
+    expose_headers=["X-Request-ID", "X-Correlation-ID", "Retry-After", "Idempotency-Replayed", "Payment-Posted"],
 )
 
 
@@ -65,7 +78,15 @@ async def database_error_handler(request: Request, exc: SQLAlchemyError):
 @app.middleware("http")
 async def prevent_auth_caching(request: Request, call_next):
     response = await call_next(request)
-    if request.url.path in {"/register", "/login", "/me", "/accounts", "/contacts", "/payment-requests", "/splits"} or request.url.path.startswith(("/accounts/", "/payments/", "/demo/", "/contacts/", "/payment-requests/", "/splits/", "/recharge", "/bills", "/billers", "/saved-billers", "/security/")):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    response.headers['Permissions-Policy'] = 'camera=(self), microphone=(), geolocation=()'
+    if 'text/html' not in response.headers.get('Content-Type',''):
+        response.headers['Content-Security-Policy'] = "default-src 'none'; frame-ancestors 'none'"
+    if ENVIRONMENT == 'demo':
+        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    if request.url.path in {"/register", "/login", "/me", "/accounts", "/contacts", "/payment-requests", "/splits", "/metrics"} or request.url.path.startswith(("/accounts/", "/payments/", "/demo/", "/contacts/", "/payment-requests/", "/splits/", "/recharge", "/bills", "/billers", "/saved-billers", "/security/", "/activity/")):
         response.headers["Cache-Control"] = "no-store"
     return response
 

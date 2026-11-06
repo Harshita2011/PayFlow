@@ -1,0 +1,27 @@
+{
+  "kind": "in-process ASGI + real PostgreSQL + real Argon2 PIN grants",
+  "api_workers": 1,
+  "load_threads": 2,
+  "dataset_users": 3,
+  "source_accounts": 3,
+  "security_overrides": false,
+  "transactions_attempted": 18,
+  "committed_transfers": 18,
+  "seconds": 2.43,
+  "committed_tps": 7.406,
+  "p50_ms": 250.36,
+  "p95_ms": 354.93,
+  "p99_ms": 354.93,
+  "errors": 0,
+  "reconciliation": "passed",
+  "postgresql": {
+    "server_version": "16.11 (Debian 16.11-1.pgdg13+1)",
+    "max_connections": "100",
+    "shared_buffers": "128MB",
+    "synchronous_commit": "on",
+    "fsync": "on"
+  },
+  "python": "3.11.0",
+  "os": "Windows",
+  "development_records_unchanged": true
+}

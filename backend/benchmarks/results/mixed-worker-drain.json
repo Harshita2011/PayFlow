@@ -1,0 +1,10 @@
+{
+  "committed": 40,
+  "failed": 0,
+  "outbox": {
+    "PROCESSED": 76
+  },
+  "deadlocks": 0,
+  "connections": 6,
+  "lock_waiters": 0
+}
